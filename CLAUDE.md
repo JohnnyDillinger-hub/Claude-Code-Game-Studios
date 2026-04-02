@@ -1,54 +1,44 @@
-# Claude Code Game Studios -- Game Studio Agent Architecture
+# Claude Code AI/CUDA Lab
 
-Indie game development managed through 48 coordinated Claude Code subagents.
-Each agent owns a specific domain, enforcing separation of concerns and quality.
+This fork uses the existing `.claude/**` structure as its runtime, but the
+active domain is now a local AI/CUDA lab rather than a game studio template.
 
-## Technology Stack
+## Local Stack
 
-- **Engine**: [CHOOSE: Godot 4 / Unity / Unreal Engine 5]
-- **Language**: [CHOOSE: GDScript / C# / C++ / Blueprint]
-- **Version Control**: Git with trunk-based development
-- **Build System**: [SPECIFY after choosing engine]
-- **Asset Pipeline**: [SPECIFY after choosing engine]
+- **OS**: Ubuntu 22.04
+- **Version Control**: Git
+- **GPU Runtime**: NVIDIA CUDA via `nvidia-smi`
+- **Local Model Runtime**: Ollama
+- **Primary Local Model**: `qwen3-coder:30b`
+- **Interactive Agent**: Claude Code
+- **Working Languages**: Python, C++, CUDA, Bash
 
-> **Note**: Engine-specialist agents exist for Godot, Unity, and Unreal with
-> dedicated sub-specialists. Use the set matching your engine.
+## First Session
 
-## Project Structure
+@docs/local-ollama-claude-setup.md
+@docs/ai-lab-role-map.md
 
-@.claude/docs/directory-structure.md
+- Run `/bootstrap-ai-lab` to inspect the local stack and identify setup gaps.
+- Use `/review-kernel-diff` for CUDA kernels, fused ops, extensions, and other
+  low-level performance-sensitive diffs.
 
-## Engine Version Reference
+## Working Principles
 
-@docs/engine-reference/godot/VERSION.md
+- Preserve `.claude/**`; prefer additive changes in `docs/`, `scripts/`, and lab code.
+- Keep changes small, explicit, and reversible.
+- Validate the local stack before heavier work with
+  `bash scripts/smoke_test_local_stack.sh`.
+- For CUDA and performance-sensitive changes, report both correctness risk and
+  performance risk.
 
-## Technical Preferences
-
-@.claude/docs/technical-preferences.md
-
-## Coordination Rules
-
-@.claude/docs/coordination-rules.md
-
-## Collaboration Protocol
-
-**User-driven collaboration, not autonomous execution.**
-Every task follows: **Question -> Options -> Decision -> Draft -> Approval**
-
-- Agents MUST ask "May I write this to [filepath]?" before using Write/Edit tools
-- Agents MUST show drafts or summaries before requesting approval
-- Multi-file changes require explicit approval for the full changeset
-- No commits without user instruction
-
-See `docs/COLLABORATIVE-DESIGN-PRINCIPLE.md` for full protocol and examples.
-
-> **First session?** If the project has no engine configured and no game concept,
-> run `/start` to begin the guided onboarding flow.
-
-## Coding Standards
+## Reference Material
 
 @.claude/docs/coding-standards.md
-
-## Context Management
-
 @.claude/docs/context-management.md
+@.claude/docs/coordination-rules.md
+
+## Legacy Note
+
+The repository still contains game-studio agents, docs, and workflows. Treat
+them as reusable structure and examples, not as the active domain model for
+this fork.
