@@ -25,3 +25,13 @@ the most useful concepts as an AI/CUDA lab workflow.
 - The existing game-specific roles remain in the repository as legacy template material.
 - For this fork, treat the roles above as the active mental model.
 - Use `/bootstrap-ai-lab` for stack setup and `/review-kernel-diff` for low-level review.
+
+## Model Topology
+
+| Layer | Model Path | Job |
+|-------|------------|-----|
+| Primary coding runtime | `qwen3-coder:30b` | Main coding, repo editing, scripts, and day-to-day implementation |
+| Optional secondary interactive reviewer | `gemma3:12b` | Read-only analysis, review, and experiment critique |
+| Offline research backend | `google/gemma-3-12b-pt` | Controlled inference, long-context evaluation, quantization experiments, and adapter-based research |
+
+Keep Gemma PT as a second contour. Do not treat it as a drop-in replacement for the main coding runtime.

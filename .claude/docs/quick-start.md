@@ -1,5 +1,11 @@
 # Game Studio Agent Architecture -- Quick Start Guide
 
+> **Fork note:** This quick-start document is mostly legacy game-studio material.
+> For this AI/CUDA lab fork, prefer `CLAUDE.md`,
+> `docs/local-ollama-claude-setup.md`, `docs/ai-lab-role-map.md`, and the
+> skills `/bootstrap-ai-lab`, `/review-kernel-diff`,
+> `/research-turboquant`, `/benchmark-long-context`, and `/prototype-looplm`.
+
 ## What Is This?
 
 This is a complete Claude Code agent architecture for game development. It

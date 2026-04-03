@@ -1,7 +1,17 @@
 # Available Skills (Slash Commands)
 
+> **Fork note:** This repository now uses an AI/CUDA lab workflow on top of the
+> existing Claude structure. For the active local stack and research contour,
+> start with `CLAUDE.md`, `docs/local-ollama-claude-setup.md`, and the
+> AI/CUDA-specific skills below.
+
 | Command | Purpose |
 |---------|---------|
+| `/bootstrap-ai-lab` | Inspect the local AI/CUDA stack, run the repo smoke test when possible, and return exact setup commands |
+| `/review-kernel-diff` | Findings-first review of CUDA, Triton, fused op, and other low-level performance diffs |
+| `/research-turboquant` | Plan or review a small TurboQuant-style experiment around the Gemma PT research backend |
+| `/benchmark-long-context` | Plan or review a long-context comparison with strict comparability requirements |
+| `/prototype-looplm` | Scope a minimal LoopLM-style adapter experiment without overstating what it reproduces |
 | `/start` | First-time onboarding — asks where you are, then guides you to the right workflow |
 | `/design-review` | Review a game design document for completeness and consistency |
 | `/code-review` | Architectural code review for a file or changeset |

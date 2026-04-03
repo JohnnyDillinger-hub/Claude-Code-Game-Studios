@@ -13,6 +13,14 @@ active domain is now a local AI/CUDA lab rather than a game studio template.
 - **Interactive Agent**: Claude Code
 - **Working Languages**: Python, C++, CUDA, Bash
 
+## Model Topology
+
+- **Primary coding runtime**: keep `qwen3-coder:30b` as the main local coding backend.
+- **Optional secondary interactive reviewer**: `gemma3:12b` can be used for read-only review or analysis when running a local Ollama-backed workflow.
+- **Offline research backend**: keep `google/gemma-3-12b-pt` in a separate Hugging Face / Transformers runtime for controlled inference, long-context evaluation, quantization experiments, and adapter-based research.
+
+The Gemma PT backend is a second contour, not a replacement for the main coding path.
+
 ## First Session
 
 @docs/local-ollama-claude-setup.md
@@ -21,6 +29,8 @@ active domain is now a local AI/CUDA lab rather than a game studio template.
 - Run `/bootstrap-ai-lab` to inspect the local stack and identify setup gaps.
 - Use `/review-kernel-diff` for CUDA kernels, fused ops, extensions, and other
   low-level performance-sensitive diffs.
+- Use `/research-turboquant`, `/benchmark-long-context`, and `/prototype-looplm`
+  for the Gemma-backed research contour.
 
 ## Working Principles
 

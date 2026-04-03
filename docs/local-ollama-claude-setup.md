@@ -84,6 +84,44 @@ Suggested first actions inside Claude Code:
 - `/bootstrap-ai-lab`
 - `/review-kernel-diff [path]`
 
+## Optional second interactive model
+
+If you want a second local model for read-only analysis or review, keep it
+separate from the main coding backend:
+
+```bash
+ollama pull gemma3:12b
+```
+
+Keep `qwen3-coder:30b` as the main coding path. Treat `gemma3:12b` as an
+optional secondary reviewer or research companion.
+
+## Offline Gemma PT research backend
+
+Use `google/gemma-3-12b-pt` as a separate Hugging Face / Transformers runtime,
+not as a direct replacement for the main coding loop.
+
+This repository is gated on Hugging Face, so accept the Gemma license there
+first, then create a dedicated environment:
+
+```bash
+python3 -m venv .venv-gemma
+source .venv-gemma/bin/activate
+pip install -U pip
+pip install -U torch transformers accelerate sentencepiece datasets peft trl bitsandbytes huggingface_hub
+huggingface-cli login
+python scripts/gemma_pt/load_gemma_pt.py
+python scripts/gemma_pt/infer_gemma_pt.py --prompt "Summarize why a baseline matters before quantization."
+```
+
+The initial research scaffolding in this fork is:
+
+- `research/turboquant/`
+- `research/long_context/`
+- `research/looplm/`
+- `scripts/gemma_pt/load_gemma_pt.py`
+- `scripts/gemma_pt/infer_gemma_pt.py`
+
 ## Full Command Sequence
 
 ```bash
@@ -109,4 +147,17 @@ ollama pull qwen3-coder:30b
 curl -fsSL claude.ai/install.sh | bash
 bash scripts/smoke_test_local_stack.sh
 claude
+```
+
+Optional secondary-model and PT backend commands:
+
+```bash
+cd /path/to/Claude-Code-Game-Studios
+ollama pull gemma3:12b
+python3 -m venv .venv-gemma
+source .venv-gemma/bin/activate
+pip install -U pip
+pip install -U torch transformers accelerate sentencepiece datasets peft trl bitsandbytes huggingface_hub
+huggingface-cli login
+python scripts/gemma_pt/load_gemma_pt.py
 ```

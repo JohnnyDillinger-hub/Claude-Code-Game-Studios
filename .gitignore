@@ -95,6 +95,15 @@ __pycache__/
 *.pyc
 node_modules/
 .npm/
+.venv-gemma/
+
+# === Local AI/CUDA Experiment Outputs ===
+research/turboquant/runs/*
+!research/turboquant/runs/.gitkeep
+research/long_context/results/*
+!research/long_context/results/.gitkeep
+research/looplm/runs/*
+!research/looplm/runs/.gitkeep
 
 # === Archives ===
 *.zip
