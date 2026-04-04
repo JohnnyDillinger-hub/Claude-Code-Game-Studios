@@ -1,0 +1,95 @@
+[
+  {
+    "node_id": "remote-4gpu-a",
+    "host": "10.0.0.42",
+    "available_until": "2035-01-01T18:00:00Z",
+    "gpu_count": 4,
+    "gpus": [
+      {
+        "index": 0,
+        "uuid": "GPU-REM-A0",
+        "total_memory_mib": 49152,
+        "free_memory_mib": 36000,
+        "utilization_pct": 12
+      },
+      {
+        "index": 1,
+        "uuid": "GPU-REM-A1",
+        "total_memory_mib": 49152,
+        "free_memory_mib": 35000,
+        "utilization_pct": 5
+      },
+      {
+        "index": 2,
+        "uuid": "GPU-REM-A2",
+        "total_memory_mib": 49152,
+        "free_memory_mib": 34000,
+        "utilization_pct": 0
+      },
+      {
+        "index": 3,
+        "uuid": "GPU-REM-A3",
+        "total_memory_mib": 49152,
+        "free_memory_mib": 33000,
+        "utilization_pct": 0
+      }
+    ],
+    "cached_models": [
+      "gemma3:12b",
+      "google/gemma-3-12b-pt"
+    ],
+    "labels": {
+      "site": "rack-a",
+      "role": "shared-cluster"
+    },
+    "trust_tier": "trusted",
+    "network_tier": "lan"
+  },
+  {
+    "node_id": "remote-1gpu-b",
+    "host": "10.0.0.58",
+    "available_until": "2035-01-02T08:00:00Z",
+    "gpu_count": 1,
+    "gpus": [
+      {
+        "index": 0,
+        "uuid": "GPU-REM-B0",
+        "total_memory_mib": 98304,
+        "free_memory_mib": 70000,
+        "utilization_pct": 4
+      }
+    ],
+    "cached_models": [
+      "qwen3-coder:30b",
+      "gemma3:12b"
+    ],
+    "labels": {
+      "site": "rack-b",
+      "role": "burst-capacity"
+    },
+    "trust_tier": "trusted",
+    "network_tier": "wan"
+  },
+  {
+    "node_id": "remote-expired-c",
+    "host": "10.0.0.99",
+    "available_until": "2025-01-01T00:00:00Z",
+    "gpu_count": 1,
+    "gpus": [
+      {
+        "index": 0,
+        "uuid": "GPU-REM-C0",
+        "total_memory_mib": 24576,
+        "free_memory_mib": 24000,
+        "utilization_pct": 0
+      }
+    ],
+    "cached_models": [],
+    "labels": {
+      "site": "retired",
+      "role": "expired"
+    },
+    "trust_tier": "trusted",
+    "network_tier": "wan"
+  }
+]

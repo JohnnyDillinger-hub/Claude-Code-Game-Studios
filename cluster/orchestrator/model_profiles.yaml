@@ -1,0 +1,44 @@
+{
+  "profiles": {
+    "gemma-3-12b-pt": {
+      "model_name": "google/gemma-3-12b-pt",
+      "required_free_vram_mib": 24576,
+      "runtime_class": "research-offline",
+      "preferred_backend": "python-hf",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+      }
+    },
+    "gemma-pt-12b": {
+      "model_name": "google/gemma-3-12b-pt",
+      "required_free_vram_mib": 24576,
+      "runtime_class": "research-offline",
+      "preferred_backend": "python-hf",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+      }
+    },
+    "gemma3-12b": {
+      "model_name": "gemma3:12b",
+      "required_free_vram_mib": 24000,
+      "runtime_class": "reviewer",
+      "preferred_backend": "ollama",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+      }
+    },
+    "qwen-coder-30b": {
+      "model_name": "qwen3-coder:30b",
+      "required_free_vram_mib": 45000,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "ollama",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+      }
+    }
+  }
+}

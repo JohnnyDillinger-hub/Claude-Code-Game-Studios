@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_request.schema.json",
+  "title": "AgentRequest",
+  "type": "object",
+  "required": [
+    "agent_id",
+    "required_vram_mib"
+  ],
+  "properties": {
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_id": {
+      "type": "string"
+    },
+    "required_vram_mib": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "trust_tier": {
+      "type": "string"
+    },
+    "network_tier": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

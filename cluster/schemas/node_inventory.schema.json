@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/node_inventory.schema.json",
+  "title": "NodeInventory",
+  "type": "object",
+  "required": [
+    "node_id",
+    "host",
+    "available_until",
+    "gpu_count",
+    "gpus",
+    "cached_models"
+  ],
+  "properties": {
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1
+    },
+    "available_until": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "gpu_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cached_models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "trust_tier": {
+      "type": "string"
+    },
+    "network_tier": {
+      "type": "string"
+    },
+    "gpus": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "index",
+          "total_memory_mib",
+          "free_memory_mib"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "uuid": {
+            "type": "string"
+          },
+          "total_memory_mib": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "free_memory_mib": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "utilization_pct": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "lease_info": {
+      "type": "object",
+      "properties": {
+        "available_until": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "lease_duration_seconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
