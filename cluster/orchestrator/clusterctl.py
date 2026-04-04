@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
@@ -84,7 +84,7 @@ def _build_request(args: argparse.Namespace) -> AgentRequest:
 
 
 def _print_inventory_summary(nodes: list[NodeInventory]) -> None:
-    now = datetime.now(tz=UTC)
+    now = datetime.now(tz=timezone.utc)
     for node in nodes:
         status = "expired" if node.is_expired(now=now) else "active"
         cached = ", ".join(node.cached_models) if node.cached_models else "-"
