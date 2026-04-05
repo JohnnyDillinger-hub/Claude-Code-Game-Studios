@@ -209,6 +209,24 @@ def start_background_process(
     return int(process.pid)
 
 
+def ensure_ollama_model_available(
+    model: str,
+    *,
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> None:
+    completed = subprocess.run(
+        ["ollama", "pull", model],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=True,
+    )
+    if completed.returncode != 0:
+        raise WorkerError(f"Failed to make model {model!r} available in the dedicated Ollama runtime")
+
+
 def load_session_payload(path: Path) -> dict[str, Any] | None:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -341,6 +359,9 @@ def launch_ollama_worker(args: argparse.Namespace, session_dir: Path) -> WorkerS
     endpoint_url = f"http://{args.server_host}:{port}"
     health_url = f"{endpoint_url}/api/tags"
     existing = load_session_payload(session_path)
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
+    env["OLLAMA_HOST"] = f"{args.server_host}:{port}"
     if (
         existing is not None
         and existing.get("listen_port") == port
@@ -352,6 +373,11 @@ def launch_ollama_worker(args: argparse.Namespace, session_dir: Path) -> WorkerS
                 [health_url],
                 startup_timeout_seconds=3,
                 request_timeout_seconds=2,
+            )
+            ensure_ollama_model_available(
+                args.model,
+                env=env,
+                timeout_seconds=args.request_timeout_seconds,
             )
             warmup = post_json(
                 f"{endpoint_url}/api/generate",
@@ -408,10 +434,6 @@ def launch_ollama_worker(args: argparse.Namespace, session_dir: Path) -> WorkerS
     except (error.URLError, json.JSONDecodeError):
         pass
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
-    env["OLLAMA_HOST"] = f"{args.server_host}:{port}"
-
     write_session_payload(
         session_path,
         WorkerSession(
@@ -444,6 +466,11 @@ def launch_ollama_worker(args: argparse.Namespace, session_dir: Path) -> WorkerS
         [health_url],
         startup_timeout_seconds=args.startup_timeout_seconds,
         request_timeout_seconds=min(args.request_timeout_seconds, 10),
+    )
+    ensure_ollama_model_available(
+        args.model,
+        env=env,
+        timeout_seconds=args.request_timeout_seconds,
     )
     warmup = post_json(
         f"{endpoint_url}/api/generate",
