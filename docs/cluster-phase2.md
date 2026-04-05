@@ -1,5 +1,8 @@
 # Cluster Phase 2
 
+For the dedicated backend runtime launch added after Phase 2, see
+`docs/cluster-phase3-runtime-launch.md`.
+
 Phase 2 extends the Phase 1 inventory and scheduler layer with:
 
 - heartbeat-based node updates
@@ -58,12 +61,9 @@ Each profile describes:
 3. build a deterministic local or SSH launch command
 4. optionally execute it
 
-The current worker path still uses a placeholder entrypoint:
-
-- `python3 -m cluster.orchestrator.remote_worker`
-
-That keeps Phase 2 runnable without pretending the full remote agent runtime is
-already finished.
+Phase 2 established the lease-aware SSH launch surface. The dedicated backend
+runtime launched by that path is documented separately in
+`docs/cluster-phase3-runtime-launch.md`.
 
 ## Main Commands
 

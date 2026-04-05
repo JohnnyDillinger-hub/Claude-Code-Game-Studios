@@ -46,8 +46,9 @@ Phase 2 launcher behavior:
   - SSH dry-run
   - SSH execution
 
-The launched worker remains a placeholder runtime entrypoint rather than a full
-remote orchestrator. That keeps Phase 2 honest about scope.
+Phase 2 stops at lease-aware launch planning and execution. The dedicated
+backend runtime started by that worker path is described in
+`docs/cluster-architecture-phase3.md`.
 
 ## Phase 1 vs Phase 2
 

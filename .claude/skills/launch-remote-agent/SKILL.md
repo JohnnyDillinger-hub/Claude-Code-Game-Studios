@@ -1,6 +1,6 @@
 ---
 name: launch-remote-agent
-description: "Compute a Phase 2 placement and build or execute a lease-aware single-GPU remote launch command."
+description: "Compute a placement and build or execute a lease-aware single-GPU remote backend launch over SSH."
 argument-hint: "[agent-id] [profile]"
 user-invocable: true
 allowed-tools: Read, Glob, Grep, Bash
@@ -11,7 +11,8 @@ When this skill is invoked:
 1. Read:
    - `CLAUDE.md`
    - `docs/cluster-phase2.md`
-   - `docs/cluster-architecture-phase2.md`
+   - `docs/cluster-phase3-runtime-launch.md`
+   - `docs/cluster-architecture-phase3.md`
 
 2. Use the repo CLI instead of inventing launch logic:
    - `python3 -m cluster.orchestrator.clusterctl launch-agent ...`
@@ -41,6 +42,6 @@ Use this output shape:
 ```
 
 Rules:
-- Phase 2 is still single-agent single-GPU only.
+- Runtime launch is still single-agent single-GPU only.
 - Do not claim distributed or multi-GPU launch support.
 - If launch is blocked by lease expiry or stale state, say so directly.

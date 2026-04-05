@@ -7,7 +7,14 @@
       "preferred_backend": "python-hf",
       "launch": {
         "entrypoint_module": "cluster.orchestrator.remote_worker",
-        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "python-hf-probe",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-gemma/bin/python",
+        "script_path": "scripts/gemma_pt/infer_gemma_pt.py",
+        "session_dir": "production/session-state/remote-workers",
+        "request_timeout_seconds": 240,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 32
       }
     },
     "gemma-pt-12b": {
@@ -17,7 +24,33 @@
       "preferred_backend": "python-hf",
       "launch": {
         "entrypoint_module": "cluster.orchestrator.remote_worker",
-        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "python-hf-probe",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-gemma/bin/python",
+        "script_path": "scripts/gemma_pt/infer_gemma_pt.py",
+        "session_dir": "production/session-state/remote-workers",
+        "request_timeout_seconds": 240,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 32
+      }
+    },
+    "gemma3-4b": {
+      "model_name": "gemma3:4b",
+      "required_free_vram_mib": 5000,
+      "runtime_class": "reviewer",
+      "preferred_backend": "ollama",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "ollama-server",
+        "server_host": "127.0.0.1",
+        "port_base": 17434,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 180,
+        "request_timeout_seconds": 180,
+        "warmup_prompt": "Reply with exactly READY",
+        "warmup_keep_alive": "15m",
+        "max_new_tokens": 8
       }
     },
     "gemma3-12b": {
@@ -27,7 +60,16 @@
       "preferred_backend": "ollama",
       "launch": {
         "entrypoint_module": "cluster.orchestrator.remote_worker",
-        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "ollama-server",
+        "server_host": "127.0.0.1",
+        "port_base": 17434,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 180,
+        "request_timeout_seconds": 240,
+        "warmup_prompt": "Reply with exactly READY",
+        "warmup_keep_alive": "15m",
+        "max_new_tokens": 8
       }
     },
     "qwen-coder-30b": {
@@ -37,7 +79,38 @@
       "preferred_backend": "ollama",
       "launch": {
         "entrypoint_module": "cluster.orchestrator.remote_worker",
-        "repo_root_default": "$HOME/Claude-Code-Game-Studios"
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "ollama-server",
+        "server_host": "127.0.0.1",
+        "port_base": 17434,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 240,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "warmup_keep_alive": "15m",
+        "max_new_tokens": 8
+      }
+    },
+    "qwen-coder-30b-vllm": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 45000,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "vllm",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "vllm-server",
+        "server_host": "127.0.0.1",
+        "port_base": 18000,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 300,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "vllm_launch_module": "vllm.entrypoints.openai.api_server",
+        "gpu_memory_utilization": 0.9,
+        "tensor_parallel_size": 1,
+        "max_model_len": 65536
       }
     }
   }

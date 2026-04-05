@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import shlex
 import subprocess
 from typing import Any
@@ -20,6 +21,7 @@ class LaunchResult:
     executed: bool
     stdout: str | None = None
     stderr: str | None = None
+    worker_payload: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -36,7 +38,25 @@ class LaunchResult:
             payload["stdout"] = self.stdout
         if self.stderr:
             payload["stderr"] = self.stderr
+        if self.worker_payload is not None:
+            payload["worker"] = self.worker_payload
         return payload
+
+
+def _append_optional_arg(command: list[str], flag: str, value: Any) -> None:
+    if value is None:
+        return
+    command.extend([flag, str(value)])
+
+
+def _parse_worker_payload(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def ensure_launchable(
@@ -66,7 +86,7 @@ def build_worker_command(
     if not decision.is_placed:
         raise ValueError("Cannot build a worker command for a rejected placement decision")
     gpu_index = decision.gpu_index if decision.gpu_index is not None else 0
-    return [
+    command = [
         "python3",
         "-m",
         profile.launch_metadata["entrypoint_module"],
@@ -83,6 +103,51 @@ def build_worker_command(
         "--node-id",
         decision.node_id or "unknown-node",
     ]
+    launch_metadata = profile.launch_metadata
+    _append_optional_arg(command, "--launch-mode", launch_metadata.get("launch_mode"))
+    _append_optional_arg(command, "--session-dir", launch_metadata.get("session_dir"))
+    _append_optional_arg(command, "--server-host", launch_metadata.get("server_host"))
+    _append_optional_arg(command, "--port-base", launch_metadata.get("port_base"))
+    _append_optional_arg(
+        command,
+        "--startup-timeout-seconds",
+        launch_metadata.get("startup_timeout_seconds"),
+    )
+    _append_optional_arg(
+        command,
+        "--request-timeout-seconds",
+        launch_metadata.get("request_timeout_seconds"),
+    )
+    _append_optional_arg(command, "--warmup-prompt", launch_metadata.get("warmup_prompt"))
+    _append_optional_arg(
+        command,
+        "--warmup-keep-alive",
+        launch_metadata.get("warmup_keep_alive"),
+    )
+    _append_optional_arg(command, "--max-new-tokens", launch_metadata.get("max_new_tokens"))
+    _append_optional_arg(
+        command,
+        "--python-executable",
+        launch_metadata.get("python_executable"),
+    )
+    _append_optional_arg(command, "--script-path", launch_metadata.get("script_path"))
+    _append_optional_arg(
+        command,
+        "--vllm-launch-module",
+        launch_metadata.get("vllm_launch_module"),
+    )
+    _append_optional_arg(
+        command,
+        "--gpu-memory-utilization",
+        launch_metadata.get("gpu_memory_utilization"),
+    )
+    _append_optional_arg(command, "--max-model-len", launch_metadata.get("max_model_len"))
+    _append_optional_arg(
+        command,
+        "--tensor-parallel-size",
+        launch_metadata.get("tensor_parallel_size"),
+    )
+    return command
 
 
 def build_remote_ssh_command(
@@ -134,7 +199,7 @@ def plan_launch(
             command=shlex.join(worker_command),
             agent_id=request.agent_id,
             node_id=decision.node_id,
-            reason="Phase 2 local launch path prepared for a single-agent single-GPU worker.",
+            reason="Phase 3 local launch path prepared for a real single-agent single-GPU backend worker.",
             executed=False,
         )
 
@@ -155,7 +220,7 @@ def plan_launch(
         command=ssh_command,
         agent_id=request.agent_id,
         node_id=decision.node_id,
-        reason="Phase 2 remote SSH launch path prepared for a single-agent single-GPU worker.",
+        reason="Phase 3 remote SSH launch path prepared for a real single-agent single-GPU backend worker.",
         executed=False,
     )
 
@@ -205,6 +270,7 @@ def launch_agent(
             executed=True,
             stdout=completed.stdout.strip() or None,
             stderr=completed.stderr.strip() or None,
+            worker_payload=_parse_worker_payload(completed.stdout.strip() or None),
         )
     except subprocess.CalledProcessError as exc:
         return LaunchResult(
@@ -217,4 +283,5 @@ def launch_agent(
             executed=True,
             stdout=(exc.stdout or "").strip() or None,
             stderr=(exc.stderr or "").strip() or None,
+            worker_payload=_parse_worker_payload((exc.stdout or "").strip() or None),
         )
