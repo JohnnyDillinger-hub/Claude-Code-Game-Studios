@@ -94,16 +94,18 @@
     "qwen-coder-30b-vllm": {
       "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
       "required_free_vram_mib": 45000,
+      "required_gpu_count": 1,
       "runtime_class": "coding-agent",
       "preferred_backend": "vllm",
       "launch": {
         "entrypoint_module": "cluster.orchestrator.remote_worker",
         "repo_root_default": "$HOME/Claude-Code-Game-Studios",
         "launch_mode": "vllm-server",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-vllm/bin/python",
         "server_host": "127.0.0.1",
         "port_base": 18000,
         "session_dir": "production/session-state/remote-workers",
-        "startup_timeout_seconds": 300,
+        "startup_timeout_seconds": 900,
         "request_timeout_seconds": 300,
         "warmup_prompt": "Reply with exactly READY",
         "max_new_tokens": 8,
@@ -111,6 +113,56 @@
         "gpu_memory_utilization": 0.9,
         "tensor_parallel_size": 1,
         "max_model_len": 65536
+      }
+    },
+    "qwen-coder-30b-vllm-tp2": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 30000,
+      "required_gpu_count": 2,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "vllm",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "vllm-server",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-vllm/bin/python",
+        "server_host": "127.0.0.1",
+        "port_base": 18020,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "vllm_launch_module": "vllm.entrypoints.openai.api_server",
+        "gpu_memory_utilization": 0.96,
+        "tensor_parallel_size": 2,
+        "max_model_len": 15360,
+        "enforce_eager": true
+      }
+    },
+    "qwen-coder-30b-vllm-tp4": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 20000,
+      "required_gpu_count": 4,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "vllm",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "vllm-server",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-vllm/bin/python",
+        "server_host": "127.0.0.1",
+        "port_base": 18100,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "vllm_launch_module": "vllm.entrypoints.openai.api_server",
+        "gpu_memory_utilization": 0.92,
+        "tensor_parallel_size": 4,
+        "max_model_len": 32768,
+        "enforce_eager": true
       }
     }
   }

@@ -46,6 +46,86 @@
     "network_tier": {
       "type": "string"
     },
+    "access": {
+      "type": "object",
+      "properties": {
+        "ssh_user": {
+          "type": "string"
+        },
+        "ssh_port": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "repo_root": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "installed"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          },
+          "executable": {
+            "type": "string"
+          },
+          "supported_topologies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "system_info": {
+      "type": "object",
+      "properties": {
+        "hostname": {
+          "type": "string"
+        },
+        "python_version": {
+          "type": "string"
+        },
+        "driver_version": {
+          "type": "string"
+        },
+        "cuda_version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "topology": {
+      "type": "object",
+      "required": [
+        "single_node_multi_gpu"
+      ],
+      "properties": {
+        "single_node_multi_gpu": {
+          "type": "boolean"
+        },
+        "interconnect": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "gpus": {
       "type": "array",
       "items": {

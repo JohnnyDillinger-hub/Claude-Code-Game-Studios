@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import combinations
 from typing import Iterable
 
 from cluster.models import AgentRequest, GPUInventory, NodeInventory, PlacementDecision
@@ -10,18 +11,37 @@ from cluster.models import AgentRequest, GPUInventory, NodeInventory, PlacementD
 @dataclass(frozen=True, slots=True)
 class _Candidate:
     node: NodeInventory
-    gpu: GPUInventory
+    gpus: tuple[GPUInventory, ...]
     model_cached: bool
     lease_remaining_seconds: float
 
+    @property
+    def gpu_indices(self) -> tuple[int, ...]:
+        return tuple(gpu.index for gpu in self.gpus)
 
-def _candidate_sort_key(candidate: _Candidate) -> tuple[float, float, float, str, int]:
+    @property
+    def gpu_uuids(self) -> tuple[str, ...]:
+        return tuple(gpu.uuid for gpu in self.gpus if gpu.uuid is not None)
+
+    @property
+    def min_free_memory_mib(self) -> int:
+        return min(gpu.free_memory_mib for gpu in self.gpus)
+
+    @property
+    def total_free_memory_mib(self) -> int:
+        return sum(gpu.free_memory_mib for gpu in self.gpus)
+
+
+def _candidate_sort_key(
+    candidate: _Candidate,
+) -> tuple[float, float, float, float, str, tuple[int, ...]]:
     return (
         -float(candidate.model_cached),
         -candidate.lease_remaining_seconds,
-        -float(candidate.gpu.free_memory_mib),
+        -float(candidate.min_free_memory_mib),
+        -float(candidate.total_free_memory_mib),
         candidate.node.node_id,
-        candidate.gpu.index,
+        candidate.gpu_indices,
     )
 
 
@@ -39,6 +59,7 @@ def _candidate_gpus(
     now: datetime,
 ) -> list[_Candidate]:
     candidates: list[_Candidate] = []
+    required_gpu_count = max(int(request.required_gpu_count), 1)
     for node in nodes:
         if node.is_expired(now=now):
             continue
@@ -49,37 +70,52 @@ def _candidate_gpus(
         if not _matching_labels(request, node):
             continue
         cached = bool(request.model_id and request.model_id in node.cached_models)
-        for gpu in node.gpus:
-            if gpu.free_memory_mib >= request.required_vram_mib:
-                candidates.append(
-                    _Candidate(
-                        node=node,
-                        gpu=gpu,
-                        model_cached=cached,
-                        lease_remaining_seconds=node.lease.remaining_seconds(now=now),
-                    )
+        eligible_gpus = tuple(
+            gpu for gpu in node.gpus if gpu.free_memory_mib >= request.required_vram_mib
+        )
+        if len(eligible_gpus) < required_gpu_count:
+            continue
+        for gpu_group in combinations(eligible_gpus, required_gpu_count):
+            candidates.append(
+                _Candidate(
+                    node=node,
+                    gpus=tuple(gpu_group),
+                    model_cached=cached,
+                    lease_remaining_seconds=node.lease.remaining_seconds(now=now),
                 )
+            )
     return sorted(candidates, key=_candidate_sort_key)
 
 
 def _placed_decision(request: AgentRequest, candidate: _Candidate, source: str) -> PlacementDecision:
     cache_note = "cached model" if candidate.model_cached else "cold model"
-    reason = (
-        f"Placed on {source} node {candidate.node.node_id} gpu {candidate.gpu.index} "
-        f"with {candidate.gpu.free_memory_mib} MiB free VRAM ({cache_note})."
-    )
+    gpu_indices = candidate.gpu_indices
+    if len(gpu_indices) == 1:
+        reason = (
+            f"Placed on {source} node {candidate.node.node_id} gpu {gpu_indices[0]} "
+            f"with {candidate.min_free_memory_mib} MiB free VRAM ({cache_note})."
+        )
+    else:
+        gpu_text = ",".join(str(index) for index in gpu_indices)
+        reason = (
+            f"Placed on {source} node {candidate.node.node_id} gpus [{gpu_text}] "
+            f"with at least {candidate.min_free_memory_mib} MiB free VRAM on each GPU "
+            f"({cache_note})."
+        )
     return PlacementDecision(
         status="placed",
         reason=reason,
         agent_id=request.agent_id,
         node_id=candidate.node.node_id,
         host=candidate.node.host,
-        gpu_index=candidate.gpu.index,
-        gpu_uuid=candidate.gpu.uuid,
+        gpu_index=gpu_indices[0],
+        gpu_indices=gpu_indices,
+        gpu_uuid=candidate.gpu_uuids[0] if candidate.gpu_uuids else None,
+        gpu_uuids=candidate.gpu_uuids,
         source=source,
         model_cached=candidate.model_cached,
         required_vram_mib=request.required_vram_mib,
-        available_vram_mib=candidate.gpu.free_memory_mib,
+        available_vram_mib=candidate.min_free_memory_mib,
         available_until=candidate.node.available_until,
     )
 
@@ -104,8 +140,15 @@ def schedule_agent(
     return PlacementDecision(
         status="rejected",
         reason=(
-            f"No non-expired single GPU has at least {request.required_vram_mib} MiB "
-            "of free VRAM for this Phase 1 placement request."
+            (
+                f"No non-expired single GPU has at least {request.required_vram_mib} MiB "
+                "of free VRAM for this Phase 1 placement request."
+            )
+            if request.required_gpu_count == 1
+            else (
+                f"No non-expired single node has {request.required_gpu_count} GPUs with at least "
+                f"{request.required_vram_mib} MiB of free VRAM each for this placement request."
+            )
         ),
         agent_id=request.agent_id,
         required_vram_mib=request.required_vram_mib,

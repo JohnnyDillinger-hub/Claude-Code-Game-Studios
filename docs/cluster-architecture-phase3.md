@@ -15,17 +15,18 @@ shapes:
 
 ## Runtime Model
 
-### Dedicated per-GPU server
+### Dedicated backend server
 
-For `ollama` and `vllm`, Phase 3 launches a dedicated backend process per agent
-and per GPU. This keeps the existing scheduler assumption intact:
+For `ollama` and `vllm`, Phase 3 launches a dedicated backend process per agent.
+For Ollama this remains one GPU per agent. For vLLM, Phase 3 can now also
+launch a single-node tensor-parallel worker that reserves multiple GPUs on the
+same node.
 
 - one agent
-- one GPU
 - one target node
 
-The worker chooses deterministic per-GPU ports from the profile metadata and
-stores a session record on disk.
+The worker chooses deterministic ports from the profile metadata and stores a
+session record on disk, including the reserved GPU indices.
 
 ### Session record
 
@@ -50,13 +51,13 @@ Phase 3 still depends on:
 The new worker adds:
 
 - reuse of a live session for the same agent
-- conflict detection when another agent already owns the same GPU slot
+- conflict detection when another agent already owns any overlapping GPU slot
 - backend health checks before a launch is considered successful
 
 ## What Phase 3 Still Does Not Do
 
-- coordinate multi-GPU inference
-- implement tensor parallel over more than one GPU
+- coordinate multi-node inference
+- implement multi-node tensor parallel or pipeline parallel
 - build a persistent orchestrator daemon
 - solve auth, billing, or marketplace concerns
 - expose secure public-internet node discovery

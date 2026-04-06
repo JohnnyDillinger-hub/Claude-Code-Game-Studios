@@ -7,7 +7,7 @@ launcher.
 
 - keeps Phase 1 and Phase 2 inventory, lease, and scheduling behavior intact
 - launches one real runtime target per agent
-- keeps the Phase 1 rule of one agent per one GPU
+- keeps the Phase 1 rule of one agent per one placement target
 - writes a per-agent session record under
   `production/session-state/remote-workers/`
 
@@ -29,13 +29,14 @@ This avoids relying on a shared system Ollama daemon when GPU affinity matters.
 
 For `vllm` profiles, the remote worker now:
 
-1. chooses a deterministic per-GPU port
+1. chooses a deterministic port for the selected GPU group
 2. starts `python -m vllm.entrypoints.openai.api_server`
 3. waits for `/health` or `/v1/models`
 4. writes the endpoint, logs, and PID into the session file
 
-Phase 3 still fixes `tensor_parallel_size=1`. Multi-GPU-per-agent stays out of
-scope.
+Single-node tensor parallel is now supported for dedicated `vllm` profiles such
+as `qwen-coder-30b-vllm-tp2` and `qwen-coder-30b-vllm-tp4`, where one agent can
+reserve multiple GPUs on the same node.
 
 ### Python / Hugging Face
 
@@ -51,14 +52,16 @@ Each launched worker writes JSON such as:
 {
   "status": "launched",
   "agent_id": "qwen-worker-a",
-  "node_id": "cluster-pro6000",
-  "backend": "ollama",
-  "model": "qwen3-coder:30b",
+  "node_id": "cluster-5090x2",
+  "backend": "vllm",
+  "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
   "gpu_index": 0,
-  "listen_port": 17434,
-  "endpoint_url": "http://127.0.0.1:17434",
+  "gpu_indices": [0, 1],
+  "tensor_parallel_size": 2,
+  "listen_port": 18020,
+  "endpoint_url": "http://127.0.0.1:18020",
   "server_pid": 12345,
-  "single_gpu_only": true
+  "single_gpu_only": false
 }
 ```
 
@@ -82,14 +85,37 @@ python3 -m cluster.orchestrator.clusterctl launch-agent \
   --state-file production/session-state/cluster-registry.json \
   --local-node-id cluster-5060ti \
   --agent-id qwen-remote-a \
-  --profile qwen-coder-30b \
-  --ssh-user root
+  --profile qwen-coder-30b-vllm-tp2 \
+  --probe-remote-sessions
 ```
+
+Probe and register a live node over SSH:
+
+```bash
+python3 -m cluster.orchestrator.clusterctl probe-remote-node \
+  --node-id cluster-5090x4-live \
+  --host 209.50.14.20 \
+  --ssh-user root \
+  --ssh-port 39693 \
+  --repo-root '$HOME/Claude-Code-Game-Studios' \
+  --state-file production/session-state/cluster-registry-live.json
+```
+
+Inspect remote session occupancy:
+
+```bash
+python3 -m cluster.orchestrator.clusterctl list-remote-sessions \
+  --state-file production/session-state/cluster-registry.json
+```
+
+If a previous dedicated worker is already holding a GPU, the optional
+`--probe-remote-sessions` check excludes that GPU before scheduling so the
+control plane fails early with an occupancy reason instead of discovering the
+conflict only after the SSH launch attempt.
 
 ## Still Out of Scope
 
-- multi-GPU-per-agent
-- tensor parallel above `1`
+- multi-node tensor parallel or pipeline parallel
 - distributed KV cache
 - production auth, billing, and hardened remote trust boundaries
 - public-internet P2P discovery

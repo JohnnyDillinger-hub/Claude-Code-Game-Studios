@@ -3,14 +3,27 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
-from cluster.models import AgentRequest, GPUInventory, LeaseInfo, NodeInventory, parse_datetime
+from cluster.models import (
+    AgentRequest,
+    GPUInventory,
+    LeaseInfo,
+    NodeAccess,
+    NodeInventory,
+    NodeSystemInfo,
+    NodeTopology,
+    RuntimeCapability,
+    parse_datetime,
+)
 from cluster.node_agent.heartbeat import HeartbeatPayload, build_heartbeat_payload
+from cluster.node_agent.probe_gpu import probe_runtime_capabilities
 from cluster.orchestrator.clusterctl import main as clusterctl_main
-from cluster.orchestrator.launcher import build_remote_ssh_command, launch_agent
+from cluster.orchestrator.launcher import LaunchResult, build_remote_ssh_command, launch_agent
 from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.state_store import RegistryStateStore
@@ -33,6 +46,10 @@ def make_node(
     available_until: str = "2035-01-01T00:00:00Z",
     gpus: list[GPUInventory] | None = None,
     cached_models: tuple[str, ...] = (),
+    access: NodeAccess | None = None,
+    runtime_capabilities: tuple[RuntimeCapability, ...] = (),
+    system_info: NodeSystemInfo | None = None,
+    topology: NodeTopology | None = None,
 ) -> NodeInventory:
     return NodeInventory(
         node_id=node_id,
@@ -40,6 +57,10 @@ def make_node(
         lease=LeaseInfo(available_until=parse_datetime(available_until)),
         gpus=tuple(gpus or ()),
         cached_models=cached_models,
+        access=access,
+        runtime_capabilities=runtime_capabilities,
+        system_info=system_info,
+        topology=topology,
     )
 
 
@@ -92,6 +113,47 @@ class ClusterPhase2Tests(unittest.TestCase):
         assert record is not None
         self.assertEqual(record.heartbeat_interval_seconds, 20)
         self.assertEqual(record.node.gpus[0].free_memory_mib, 18000)
+
+    def test_node_inventory_roundtrip_preserves_access_and_capabilities(self) -> None:
+        node = make_node(
+            "node-a",
+            gpus=[make_gpu(0, 16000), make_gpu(1, 15000)],
+            access=NodeAccess(
+                ssh_user="root",
+                ssh_port=11866,
+                repo_root="$HOME/Claude-Code-Game-Studios",
+            ),
+            runtime_capabilities=(
+                RuntimeCapability(
+                    name="vllm",
+                    installed=True,
+                    version="0.19.0",
+                    executable="/root/Claude-Code-Game-Studios/.venv-vllm/bin/python",
+                    supported_topologies=("single-gpu", "tp"),
+                ),
+            ),
+            system_info=NodeSystemInfo(
+                hostname="ubuntu",
+                python_version="Python 3.10.12",
+                driver_version="570.133.20",
+                cuda_version="12.8",
+            ),
+            topology=NodeTopology(
+                single_node_multi_gpu=True,
+                interconnect="pcie",
+            ),
+        )
+
+        reloaded = NodeInventory.from_dict(node.to_dict())
+
+        assert reloaded.access is not None
+        assert reloaded.system_info is not None
+        assert reloaded.topology is not None
+        self.assertEqual(reloaded.access.ssh_port, 11866)
+        self.assertEqual(reloaded.runtime_capabilities[0].name, "vllm")
+        self.assertEqual(reloaded.runtime_capabilities[0].version, "0.19.0")
+        self.assertEqual(reloaded.system_info.cuda_version, "12.8")
+        self.assertTrue(reloaded.topology.single_node_multi_gpu)
 
     def test_expired_lease_prevents_launch(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -196,6 +258,153 @@ class ClusterPhase2Tests(unittest.TestCase):
         self.assertEqual(payload["placement"]["node_id"], "remote-node")
         self.assertEqual(payload["launch"]["status"], "ready")
         self.assertEqual(payload["launch"]["mode"], "remote-ssh")
+
+    def test_launch_agent_uses_node_access_defaults_from_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "registry.json"
+            registry = NodeRegistry(
+                [
+                    make_node("local-node", host="127.0.0.1", gpus=[make_gpu(0, 8000)]),
+                    make_node(
+                        "remote-node",
+                        host="209.50.14.20",
+                        gpus=[make_gpu(0, 70000)],
+                        cached_models=("qwen3-coder:30b",),
+                        access=NodeAccess(
+                            ssh_user="root",
+                            ssh_port=11866,
+                            repo_root="$HOME/Claude-Code-Game-Studios",
+                        ),
+                    ),
+                ]
+            )
+            RegistryStateStore(state_file).save(registry)
+
+            with patch("cluster.orchestrator.clusterctl.launch_agent") as launch_mock:
+                launch_mock.return_value = LaunchResult(
+                    status="ready",
+                    mode="remote-ssh",
+                    command="ssh ...",
+                    agent_id="dry-run-agent",
+                    node_id="remote-node",
+                    reason="dry run",
+                    executed=False,
+                )
+                exit_code = clusterctl_main(
+                    [
+                        "launch-agent",
+                        "--state-file",
+                        str(state_file),
+                        "--local-node-id",
+                        "local-node",
+                        "--agent-id",
+                        "dry-run-agent",
+                        "--profile",
+                        "qwen-coder-30b",
+                        "--dry-run",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(launch_mock.call_args.kwargs["ssh_user"], "root")
+        self.assertEqual(launch_mock.call_args.kwargs["ssh_port"], 11866)
+        self.assertEqual(
+            launch_mock.call_args.kwargs["repo_root"],
+            "$HOME/Claude-Code-Game-Studios",
+        )
+
+    def test_probe_remote_node_can_register_inventory_into_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "registry.json"
+            RegistryStateStore(state_file).save(NodeRegistry())
+            remote_payload = {
+                "node_id": "cluster-5090x2-live",
+                "host": "209.50.14.20",
+                "available_until": "2035-01-01T00:00:00Z",
+                "gpu_count": 2,
+                "gpus": [
+                    {
+                        "index": 0,
+                        "uuid": "GPU-0",
+                        "total_memory_mib": 32607,
+                        "free_memory_mib": 32000,
+                    },
+                    {
+                        "index": 1,
+                        "uuid": "GPU-1",
+                        "total_memory_mib": 32607,
+                        "free_memory_mib": 32000,
+                    },
+                ],
+                "cached_models": [],
+                "access": {
+                    "ssh_user": "root",
+                    "ssh_port": 11866,
+                    "repo_root": "$HOME/Claude-Code-Game-Studios",
+                },
+                "runtime_capabilities": [
+                    {
+                        "name": "vllm",
+                        "installed": True,
+                        "version": "0.19.0",
+                        "supported_topologies": ["single-gpu", "tp"],
+                    }
+                ],
+                "topology": {
+                    "single_node_multi_gpu": True,
+                    "interconnect": "pcie",
+                },
+            }
+
+            buffer = io.StringIO()
+            with patch("cluster.orchestrator.clusterctl.subprocess.run") as run_mock:
+                run_mock.return_value.stdout = json.dumps(remote_payload)
+                run_mock.return_value.stderr = ""
+                with redirect_stdout(buffer):
+                    exit_code = clusterctl_main(
+                        [
+                            "probe-remote-node",
+                            "--node-id",
+                            "cluster-5090x2-live",
+                            "--host",
+                            "209.50.14.20",
+                            "--ssh-user",
+                            "root",
+                            "--ssh-port",
+                            "11866",
+                            "--state-file",
+                            str(state_file),
+                        ]
+                    )
+            payload = json.loads(buffer.getvalue())
+            reloaded = RegistryStateStore(state_file).load()
+            record = reloaded.get_record("cluster-5090x2-live")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "registered")
+        assert record is not None
+        assert record.node.access is not None
+        self.assertEqual(record.node.access.ssh_port, 11866)
+        self.assertEqual(record.node.runtime_capabilities[0].name, "vllm")
+
+    def test_probe_runtime_capabilities_expands_repo_root_env_vars(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_root = Path(tmpdir)
+            python_path = repo_root / ".venv-vllm" / "bin" / "python"
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink("/usr/bin/python3", python_path)
+
+            with patch.dict("os.environ", {"TEST_REPO_ROOT": str(repo_root)}):
+                with patch(
+                    "cluster.node_agent.probe_gpu._probe_distribution_version",
+                    return_value="0.19.0",
+                ):
+                    capabilities = probe_runtime_capabilities(repo_root="$TEST_REPO_ROOT")
+
+        vllm_capability = next(item for item in capabilities if item.name == "vllm")
+        self.assertTrue(vllm_capability.installed)
+        self.assertEqual(vllm_capability.version, "0.19.0")
+        self.assertEqual(vllm_capability.executable, str(python_path))
 
 
 if __name__ == "__main__":

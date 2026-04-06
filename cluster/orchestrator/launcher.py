@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 import shlex
 import subprocess
-from typing import Any
+from typing import Any, Sequence
 
 from cluster.models import AgentRequest, PlacementDecision, utc_now
 from cluster.orchestrator.model_profiles import RuntimeProfile
@@ -49,6 +49,11 @@ def _append_optional_arg(command: list[str], flag: str, value: Any) -> None:
     command.extend([flag, str(value)])
 
 
+def _append_boolean_flag(command: list[str], flag: str, value: Any) -> None:
+    if value is True:
+        command.append(flag)
+
+
 def _parse_worker_payload(text: str | None) -> dict[str, Any] | None:
     if not text:
         return None
@@ -85,7 +90,10 @@ def build_worker_command(
 ) -> list[str]:
     if not decision.is_placed:
         raise ValueError("Cannot build a worker command for a rejected placement decision")
-    gpu_index = decision.gpu_index if decision.gpu_index is not None else 0
+    gpu_indices = decision.gpu_indices or (
+        (decision.gpu_index,) if decision.gpu_index is not None else (0,)
+    )
+    gpu_index = gpu_indices[0]
     command = [
         "python3",
         "-m",
@@ -103,6 +111,8 @@ def build_worker_command(
         "--node-id",
         decision.node_id or "unknown-node",
     ]
+    if gpu_indices:
+        command.extend(["--gpu-indices", ",".join(str(index) for index in gpu_indices)])
     launch_metadata = profile.launch_metadata
     _append_optional_arg(command, "--launch-mode", launch_metadata.get("launch_mode"))
     _append_optional_arg(command, "--session-dir", launch_metadata.get("session_dir"))
@@ -142,6 +152,7 @@ def build_worker_command(
         launch_metadata.get("gpu_memory_utilization"),
     )
     _append_optional_arg(command, "--max-model-len", launch_metadata.get("max_model_len"))
+    _append_boolean_flag(command, "--enforce-eager", launch_metadata.get("enforce_eager"))
     _append_optional_arg(
         command,
         "--tensor-parallel-size",
@@ -158,7 +169,31 @@ def build_remote_ssh_command(
     ssh_port: int | None = None,
     repo_root: str,
     gpu_index: int,
+    gpu_indices: Sequence[int] | None = None,
 ) -> str:
+    return shlex.join(
+        build_remote_ssh_argv(
+            host=host,
+            remote_command=remote_command,
+            ssh_user=ssh_user,
+            ssh_port=ssh_port,
+            repo_root=repo_root,
+            gpu_index=gpu_index,
+            gpu_indices=gpu_indices,
+        )
+    )
+
+
+def build_remote_ssh_argv(
+    *,
+    host: str,
+    remote_command: list[str] | str,
+    ssh_user: str | None = None,
+    ssh_port: int | None = None,
+    repo_root: str,
+    gpu_index: int | None,
+    gpu_indices: Sequence[int] | None = None,
+) -> list[str]:
     target = f"{ssh_user}@{host}" if ssh_user else host
     command_text = (
         remote_command if isinstance(remote_command, str) else shlex.join(remote_command)
@@ -166,16 +201,22 @@ def build_remote_ssh_command(
     repo_root_text = repo_root
     if repo_root.startswith("~/"):
         repo_root_text = "$HOME/" + repo_root[2:]
-    remote_shell = (
-        f"cd {repo_root_text} && "
-        f"CUDA_VISIBLE_DEVICES={gpu_index} {command_text}"
-    )
+    remote_shell_parts = [f"cd {repo_root_text} &&"]
+    gpu_value = None
+    if gpu_indices:
+        gpu_value = ",".join(str(index) for index in gpu_indices)
+    elif gpu_index is not None:
+        gpu_value = str(gpu_index)
+    if gpu_value is not None:
+        remote_shell_parts.append(f"CUDA_VISIBLE_DEVICES={gpu_value}")
+    remote_shell_parts.append(command_text)
+    remote_shell = " ".join(remote_shell_parts)
     parts = ["ssh"]
     if ssh_port is not None:
         parts.extend(["-p", str(ssh_port)])
     parts.append(target)
-    parts.append(shlex.quote(remote_shell))
-    return " ".join(parts)
+    parts.append(remote_shell)
+    return parts
 
 
 def plan_launch(
@@ -199,13 +240,14 @@ def plan_launch(
             command=shlex.join(worker_command),
             agent_id=request.agent_id,
             node_id=decision.node_id,
-            reason="Phase 3 local launch path prepared for a real single-agent single-GPU backend worker.",
+            reason="Phase 3 local launch path prepared for a real backend worker.",
             executed=False,
         )
 
     if decision.host is None:
         raise ValueError("Remote launch planning requires a host in PlacementDecision")
     gpu_index = decision.gpu_index if decision.gpu_index is not None else 0
+    gpu_indices = decision.gpu_indices or (gpu_index,)
     ssh_command = build_remote_ssh_command(
         host=decision.host,
         remote_command=worker_command,
@@ -213,6 +255,7 @@ def plan_launch(
         ssh_port=ssh_port,
         repo_root=repo_root,
         gpu_index=gpu_index,
+        gpu_indices=gpu_indices,
     )
     return LaunchResult(
         status="ready",
@@ -220,7 +263,7 @@ def plan_launch(
         command=ssh_command,
         agent_id=request.agent_id,
         node_id=decision.node_id,
-        reason="Phase 3 remote SSH launch path prepared for a real single-agent single-GPU backend worker.",
+        reason="Phase 3 remote SSH launch path prepared for a real backend worker.",
         executed=False,
     )
 
@@ -253,12 +296,20 @@ def launch_agent(
             command = shlex.split(plan.command)
             completed = subprocess.run(command, check=True, capture_output=True, text=True)
         else:
+            command = build_remote_ssh_argv(
+                host=decision.host or "",
+                remote_command=build_worker_command(request, decision, profile),
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                repo_root=repo_root or str(profile.launch_metadata.get("repo_root_default", ".")),
+                gpu_index=decision.gpu_index if decision.gpu_index is not None else 0,
+                gpu_indices=decision.gpu_indices or None,
+            )
             completed = subprocess.run(
-                plan.command,
+                command,
                 check=True,
                 capture_output=True,
                 text=True,
-                shell=True,
             )
         return LaunchResult(
             status="launched",

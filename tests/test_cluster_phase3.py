@@ -4,16 +4,23 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+import io
 from unittest.mock import patch
 
 from cluster.models import AgentRequest, GPUInventory, LeaseInfo, NodeInventory, PlacementDecision, parse_datetime
+from cluster.orchestrator.clusterctl import _filter_nodes_by_remote_session_claims, main as clusterctl_main
 from cluster.orchestrator.launcher import build_worker_command, launch_agent
 from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
+from cluster.orchestrator.remote_sessions import collect_session_claims
 from cluster.orchestrator.remote_worker import (
     build_vllm_server_command,
     choose_runtime_port,
     find_conflicting_session,
 )
+from cluster.orchestrator.registry import NodeRegistry
+from cluster.orchestrator.scheduler import schedule_agent
+from cluster.orchestrator.state_store import RegistryStateStore
 
 
 def make_gpu(index: int, free_mib: int, total_mib: int = 97887) -> GPUInventory:
@@ -46,8 +53,16 @@ class ClusterPhase3Tests(unittest.TestCase):
         profiles = load_runtime_profiles()
         self.assertIn("gemma3-4b", profiles)
         self.assertIn("qwen-coder-30b-vllm", profiles)
+        self.assertIn("qwen-coder-30b-vllm-tp2", profiles)
+        self.assertIn("qwen-coder-30b-vllm-tp4", profiles)
         self.assertEqual(profiles["gemma3-4b"].preferred_backend, "ollama")
+        self.assertEqual(profiles["gemma3-4b"].runtime_adapter, "ollama-server")
         self.assertEqual(profiles["qwen-coder-30b-vllm"].preferred_backend, "vllm")
+        self.assertEqual(profiles["qwen-coder-30b-vllm"].runtime_adapter, "vllm-server")
+        self.assertEqual(profiles["qwen-coder-30b-vllm-tp2"].required_gpu_count, 2)
+        self.assertTrue(profiles["qwen-coder-30b-vllm-tp2"].runtime_options["enforce_eager"])
+        self.assertEqual(profiles["qwen-coder-30b-vllm-tp4"].required_gpu_count, 4)
+        self.assertEqual(profiles["qwen-coder-30b-vllm-tp4"].runtime_options["tensor_parallel_size"], 4)
 
     def test_build_worker_command_includes_real_ollama_launch_args(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -66,6 +81,69 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("17434", command)
         self.assertIn("--session-dir", command)
         self.assertIn("production/session-state/remote-workers", command)
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("1", command)
+
+    def test_build_worker_command_includes_gpu_group_for_tp2_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-vllm-tp2")
+        request = AgentRequest(
+            agent_id="agent-tp2",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-b",
+            host="10.0.0.59",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32000,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("2", command)
+        self.assertIn("--enforce-eager", command)
+
+    def test_build_worker_command_includes_gpu_group_for_tp4_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-vllm-tp4")
+        request = AgentRequest(
+            agent_id="agent-tp4",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-c",
+            host="10.0.0.60",
+            gpu_index=0,
+            gpu_indices=(0, 1, 2, 3),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32110,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1,2,3", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("4", command)
+        self.assertIn("--max-model-len", command)
+        self.assertIn("32768", command)
 
     def test_vllm_server_command_and_port_are_single_gpu_deterministic(self) -> None:
         command = build_vllm_server_command(
@@ -77,6 +155,7 @@ class ClusterPhase3Tests(unittest.TestCase):
             tensor_parallel_size=1,
             gpu_memory_utilization=0.9,
             max_model_len=65536,
+            enforce_eager=True,
         )
 
         self.assertEqual(choose_runtime_port(18000, 1), 18001)
@@ -85,6 +164,7 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("1", command)
         self.assertIn("--max-model-len", command)
         self.assertIn("65536", command)
+        self.assertIn("--enforce-eager", command)
 
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -107,6 +187,34 @@ class ClusterPhase3Tests(unittest.TestCase):
                 node_id="node-a",
                 gpu_index=0,
                 listen_port=17434,
+            )
+
+        assert conflict is not None
+        self.assertEqual(conflict["agent_id"], "other-agent")
+
+    def test_conflicting_session_detects_overlapping_multi_gpu_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            payload = {
+                "status": "launched",
+                "agent_id": "other-agent",
+                "node_id": "node-a",
+                "gpu_index": 0,
+                "gpu_indices": [0, 1],
+                "listen_port": 18020,
+            }
+            (session_dir / "other-agent.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            conflict = find_conflicting_session(
+                session_dir,
+                agent_id="agent-a",
+                node_id="node-a",
+                gpu_index=1,
+                gpu_indices=(1, 2),
+                listen_port=18020,
             )
 
         assert conflict is not None
@@ -144,6 +252,220 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(result.worker_payload, worker_payload)
         assert result.stdout is not None
         self.assertIn("17434", result.stdout)
+
+    def test_collect_session_claims_only_returns_active_gpu_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            (session_dir / "active.json").write_text(
+                json.dumps(
+                    {
+                        "status": "launched",
+                        "agent_id": "active-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 0,
+                        "backend": "ollama",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "done.json").write_text(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "agent_id": "done-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            claims = collect_session_claims(session_dir)
+
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].agent_id, "active-agent")
+        self.assertEqual(claims[0].gpu_index, 0)
+
+    def test_collect_session_claims_expands_multi_gpu_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            (session_dir / "tp2.json").write_text(
+                json.dumps(
+                    {
+                        "status": "launched",
+                        "agent_id": "tp2-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 0,
+                        "gpu_indices": [0, 1],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            claims = collect_session_claims(session_dir)
+
+        self.assertEqual([claim.gpu_index for claim in claims], [0, 1])
+
+    def test_filter_nodes_by_remote_session_claims_removes_conflicting_gpus(self) -> None:
+        nodes = [
+            NodeInventory(
+                node_id="node-a",
+                host="node-a.example",
+                lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+                gpus=(make_gpu(0, 64000), make_gpu(1, 64000)),
+            )
+        ]
+        remote_payload = {
+            "sessions": [],
+            "claims": [
+                {
+                    "agent_id": "other-agent",
+                    "node_id": "node-a",
+                    "gpu_index": 0,
+                    "status": "launched",
+                },
+                {
+                    "agent_id": "same-agent",
+                    "node_id": "node-a",
+                    "gpu_index": 1,
+                    "status": "reused",
+                },
+            ],
+        }
+
+        with patch("cluster.orchestrator.clusterctl.subprocess.run") as run_mock:
+            run_mock.return_value.stdout = json.dumps(remote_payload)
+            filtered_nodes, claims = _filter_nodes_by_remote_session_claims(
+                nodes,
+                request_agent_id="same-agent",
+                ssh_user=None,
+                ssh_port=None,
+                repo_root="$HOME/Claude-Code-Game-Studios",
+                session_dir="production/session-state/remote-workers",
+            )
+
+        self.assertEqual(len(claims), 2)
+        self.assertEqual([gpu.index for gpu in filtered_nodes[0].gpus], [1])
+
+    def test_launch_agent_can_block_before_remote_exec_when_session_probe_finds_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "registry.json"
+            registry = NodeRegistry(
+                [
+                    NodeInventory(
+                        node_id="local-node",
+                        host="127.0.0.1",
+                        lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+                        gpus=(make_gpu(0, 8000, total_mib=16384),),
+                    ),
+                    NodeInventory(
+                        node_id="remote-node",
+                        host="remote-node.example",
+                        lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+                        gpus=(make_gpu(0, 70000),),
+                        cached_models=("qwen3-coder:30b",),
+                    ),
+                ]
+            )
+            RegistryStateStore(state_file).save(registry)
+
+            remote_payload = {
+                "sessions": [],
+                "claims": [
+                    {
+                        "agent_id": "busy-agent",
+                        "node_id": "remote-node",
+                        "gpu_index": 0,
+                        "status": "launched",
+                    }
+                ],
+            }
+
+            buffer = io.StringIO()
+            with patch("cluster.orchestrator.clusterctl.subprocess.run") as run_mock:
+                run_mock.return_value.stdout = json.dumps(remote_payload)
+                with redirect_stdout(buffer):
+                    exit_code = clusterctl_main(
+                        [
+                            "launch-agent",
+                            "--state-file",
+                            str(state_file),
+                            "--local-node-id",
+                            "local-node",
+                            "--agent-id",
+                            "new-agent",
+                            "--profile",
+                            "qwen-coder-30b",
+                            "--dry-run",
+                            "--probe-remote-sessions",
+                        ]
+                    )
+            payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["launch"]["status"], "blocked")
+        self.assertIn("busy-agent", payload["launch"]["reason"])
+
+    def test_schedule_agent_can_place_tp2_request_on_same_node_gpu_group(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-vllm-tp2")
+        request = AgentRequest(
+            agent_id="agent-tp2",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        local_node = NodeInventory(
+            node_id="local-node",
+            host="127.0.0.1",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 12000, total_mib=16384),),
+        )
+        remote_node = NodeInventory(
+            node_id="remote-tp2",
+            host="remote-tp2.example",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 32000, total_mib=32607), make_gpu(1, 32100, total_mib=32607)),
+        )
+
+        decision = schedule_agent(local_node, [remote_node], request)
+
+        self.assertTrue(decision.is_placed)
+        self.assertEqual(decision.node_id, "remote-tp2")
+        self.assertEqual(decision.gpu_indices, (0, 1))
+        self.assertEqual(decision.gpu_index, 0)
+
+    def test_schedule_agent_can_place_tp4_request_on_same_node_gpu_group(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-vllm-tp4")
+        request = AgentRequest(
+            agent_id="agent-tp4",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        local_node = NodeInventory(
+            node_id="local-node",
+            host="127.0.0.1",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 12000, total_mib=16384),),
+        )
+        remote_node = NodeInventory(
+            node_id="remote-tp4",
+            host="remote-tp4.example",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(
+                make_gpu(0, 32110, total_mib=32607),
+                make_gpu(1, 32110, total_mib=32607),
+                make_gpu(2, 32110, total_mib=32607),
+                make_gpu(3, 32110, total_mib=32607),
+            ),
+        )
+
+        decision = schedule_agent(local_node, [remote_node], request)
+
+        self.assertTrue(decision.is_placed)
+        self.assertEqual(decision.node_id, "remote-tp4")
+        self.assertEqual(decision.gpu_indices, (0, 1, 2, 3))
+        self.assertEqual(decision.gpu_index, 0)
 
 
 if __name__ == "__main__":
