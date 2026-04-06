@@ -164,6 +164,58 @@
         "max_model_len": 32768,
         "enforce_eager": true
       }
+    },
+    "qwen-coder-30b-sglang-tp2": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 30000,
+      "required_gpu_count": 2,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "sglang",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "sglang-server",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-sglang/bin/python",
+        "sglang_launch_module": "sglang.launch_server",
+        "server_host": "127.0.0.1",
+        "port_base": 19120,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 2,
+        "mem_fraction_static": 0.96,
+        "context_length": 16384,
+        "trust_remote_code": true,
+        "disable_custom_all_reduce": true
+      }
+    },
+    "qwen-coder-30b-sglang-tp4": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 20000,
+      "required_gpu_count": 4,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "sglang",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "sglang-server",
+        "python_executable": "$HOME/Claude-Code-Game-Studios/.venv-sglang/bin/python",
+        "sglang_launch_module": "sglang.launch_server",
+        "server_host": "127.0.0.1",
+        "port_base": 19140,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 4,
+        "mem_fraction_static": 0.90,
+        "context_length": 32768,
+        "trust_remote_code": true,
+        "disable_custom_all_reduce": true
+      }
     }
   }
 }

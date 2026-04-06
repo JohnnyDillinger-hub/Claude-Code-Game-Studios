@@ -38,6 +38,19 @@ Single-node tensor parallel is now supported for dedicated `vllm` profiles such
 as `qwen-coder-30b-vllm-tp2` and `qwen-coder-30b-vllm-tp4`, where one agent can
 reserve multiple GPUs on the same node.
 
+### SGLang
+
+For `sglang` profiles, the remote worker now:
+
+1. chooses a deterministic port for the selected GPU group
+2. starts `python -m sglang.launch_server`
+3. waits for `/health` or `/v1/models`
+4. writes the endpoint, logs, and PID into the session file
+
+This uses the same single-node multi-GPU reservation model as `vllm`, with
+dedicated profiles such as `qwen-coder-30b-sglang-tp2` and
+`qwen-coder-30b-sglang-tp4`.
+
 ### Python / Hugging Face
 
 For `python-hf` profiles, the worker runs a one-shot probe on the target GPU and

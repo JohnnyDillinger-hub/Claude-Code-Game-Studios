@@ -14,10 +14,13 @@ from cluster.orchestrator.launcher import build_worker_command, launch_agent
 from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
 from cluster.orchestrator.remote_sessions import collect_session_claims
 from cluster.orchestrator.remote_worker import (
+    build_sglang_server_command,
     build_vllm_server_command,
     choose_runtime_port,
     find_conflicting_session,
 )
+from cluster.orchestrator.runtime_adapters import infer_packaged_cuda_home
+from cluster.orchestrator.runtime_adapters import prepend_executable_dir_to_path
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.scheduler import schedule_agent
 from cluster.orchestrator.state_store import RegistryStateStore
@@ -55,6 +58,8 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("qwen-coder-30b-vllm", profiles)
         self.assertIn("qwen-coder-30b-vllm-tp2", profiles)
         self.assertIn("qwen-coder-30b-vllm-tp4", profiles)
+        self.assertIn("qwen-coder-30b-sglang-tp2", profiles)
+        self.assertIn("qwen-coder-30b-sglang-tp4", profiles)
         self.assertEqual(profiles["gemma3-4b"].preferred_backend, "ollama")
         self.assertEqual(profiles["gemma3-4b"].runtime_adapter, "ollama-server")
         self.assertEqual(profiles["qwen-coder-30b-vllm"].preferred_backend, "vllm")
@@ -63,6 +68,9 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertTrue(profiles["qwen-coder-30b-vllm-tp2"].runtime_options["enforce_eager"])
         self.assertEqual(profiles["qwen-coder-30b-vllm-tp4"].required_gpu_count, 4)
         self.assertEqual(profiles["qwen-coder-30b-vllm-tp4"].runtime_options["tensor_parallel_size"], 4)
+        self.assertEqual(profiles["qwen-coder-30b-sglang-tp2"].runtime_adapter, "sglang-server")
+        self.assertEqual(profiles["qwen-coder-30b-sglang-tp2"].runtime_options["tensor_parallel_size"], 2)
+        self.assertTrue(profiles["qwen-coder-30b-sglang-tp4"].runtime_options["trust_remote_code"])
 
     def test_build_worker_command_includes_real_ollama_launch_args(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -145,6 +153,79 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--max-model-len", command)
         self.assertIn("32768", command)
 
+    def test_build_worker_command_includes_sglang_launch_args_for_tp2_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-sglang-tp2")
+        request = AgentRequest(
+            agent_id="agent-sglang-tp2",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-sg2",
+            host="10.0.0.61",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32100,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--launch-mode", command)
+        self.assertIn("sglang-server", command)
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("2", command)
+        self.assertIn("--mem-fraction-static", command)
+        self.assertIn("0.96", command)
+        self.assertIn("--context-length", command)
+        self.assertIn("16384", command)
+        self.assertIn("--trust-remote-code", command)
+        self.assertIn("--disable-custom-all-reduce", command)
+
+    def test_build_worker_command_includes_sglang_launch_args_for_tp4_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-sglang-tp4")
+        request = AgentRequest(
+            agent_id="agent-sglang-tp4",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-sg4",
+            host="10.0.0.62",
+            gpu_index=0,
+            gpu_indices=(0, 1, 2, 3),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32100,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1,2,3", command)
+        self.assertIn("--sglang-launch-module", command)
+        self.assertIn("sglang.launch_server", command)
+        self.assertIn("--mem-fraction-static", command)
+        self.assertIn("0.9", command)
+        self.assertIn("--context-length", command)
+        self.assertIn("32768", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("4", command)
+        self.assertIn("--disable-custom-all-reduce", command)
+
     def test_vllm_server_command_and_port_are_single_gpu_deterministic(self) -> None:
         command = build_vllm_server_command(
             python_executable="python3",
@@ -165,6 +246,77 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--max-model-len", command)
         self.assertIn("65536", command)
         self.assertIn("--enforce-eager", command)
+
+    def test_sglang_server_command_and_port_are_multi_gpu_deterministic(self) -> None:
+        command = build_sglang_server_command(
+            python_executable="python3",
+            launch_module="sglang.launch_server",
+            host="127.0.0.1",
+            port=choose_runtime_port(19140, 0),
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            tensor_parallel_size=4,
+            mem_fraction_static=0.9,
+            context_length=32768,
+            trust_remote_code=True,
+            disable_custom_all_reduce=True,
+        )
+
+        self.assertEqual(choose_runtime_port(19140, 0), 19140)
+        self.assertEqual(command[0:3], ["python3", "-m", "sglang.launch_server"])
+        self.assertIn("--model-path", command)
+        self.assertIn("--tp", command)
+        self.assertIn("4", command)
+        self.assertIn("--mem-fraction-static", command)
+        self.assertIn("0.9", command)
+        self.assertIn("--context-length", command)
+        self.assertIn("32768", command)
+        self.assertIn("--trust-remote-code", command)
+        self.assertIn("--disable-custom-all-reduce", command)
+
+    def test_infer_packaged_cuda_home_prefers_packaged_runtime_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-sglang"
+            python_path = venv_root / "bin" / "python"
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            python_path.write_text("", encoding="utf-8")
+            cuda_runtime = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "include"
+            )
+            cuda_runtime.mkdir(parents=True, exist_ok=True)
+            (cuda_runtime / "cuda_runtime.h").write_text("", encoding="utf-8")
+
+            detected = infer_packaged_cuda_home(str(python_path))
+
+        self.assertEqual(
+            detected,
+            str(
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+            ),
+        )
+
+    def test_prepend_executable_dir_to_path_puts_venv_bin_first(self) -> None:
+        env = {"PATH": "/usr/local/bin:/usr/bin"}
+
+        prepend_executable_dir_to_path(
+            env,
+            "/tmp/.venv-sglang/bin/python",
+        )
+
+        self.assertEqual(
+            env["PATH"].split(":")[0],
+            "/tmp/.venv-sglang/bin",
+        )
 
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

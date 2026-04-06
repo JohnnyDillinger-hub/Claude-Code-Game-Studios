@@ -23,6 +23,9 @@ DEFAULT_MAX_NEW_TOKENS = 8
 DEFAULT_OLLAMA_PORT_BASE = 17434
 DEFAULT_VLLM_PORT_BASE = 18000
 DEFAULT_VLLM_LAUNCH_MODULE = "vllm.entrypoints.openai.api_server"
+DEFAULT_SGLANG_PORT_BASE = 19000
+DEFAULT_SGLANG_LAUNCH_MODULE = "sglang.launch_server"
+DEFAULT_MEM_FRACTION_STATIC = 0.9
 SESSION_OK_STATUSES = {"starting", "launched", "reused"}
 
 
@@ -169,6 +172,82 @@ def build_vllm_server_command(
     if enforce_eager:
         command.append("--enforce-eager")
     return command
+
+
+def build_sglang_server_command(
+    *,
+    python_executable: str,
+    launch_module: str,
+    host: str,
+    port: int,
+    model: str,
+    tensor_parallel_size: int,
+    mem_fraction_static: float,
+    context_length: int | None = None,
+    trust_remote_code: bool = False,
+    enable_p2p_check: bool = False,
+    disable_custom_all_reduce: bool = False,
+    disable_overlap_schedule: bool = False,
+) -> list[str]:
+    command = [
+        python_executable,
+        "-m",
+        launch_module,
+        "--model-path",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--tp",
+        str(tensor_parallel_size),
+        "--mem-fraction-static",
+        str(mem_fraction_static),
+    ]
+    if context_length is not None:
+        command.extend(["--context-length", str(context_length)])
+    if trust_remote_code:
+        command.append("--trust-remote-code")
+    if enable_p2p_check:
+        command.append("--enable-p2p-check")
+    if disable_custom_all_reduce:
+        command.append("--disable-custom-all-reduce")
+    if disable_overlap_schedule:
+        command.append("--disable-overlap-schedule")
+    return command
+
+
+def infer_packaged_cuda_home(python_executable: str) -> str | None:
+    python_path = Path(expand_path_text(python_executable))
+    venv_root = python_path.parent.parent
+    candidate_paths: list[Path] = []
+    for nvidia_root in sorted(venv_root.glob("lib/python*/site-packages/nvidia")):
+        candidate_paths.extend(
+            [
+                nvidia_root / "cuda_runtime",
+                nvidia_root / "cu13",
+                nvidia_root / "cu12",
+            ]
+        )
+        for child in sorted(nvidia_root.iterdir()):
+            if child.is_dir() and child.name.startswith("cu") and child not in candidate_paths:
+                candidate_paths.append(child)
+    for candidate in candidate_paths:
+        if (candidate / "include" / "cuda_runtime.h").exists():
+            return str(candidate)
+    return None
+
+
+def prepend_executable_dir_to_path(env: dict[str, str], executable_path: str) -> None:
+    executable_dir = str(Path(expand_path_text(executable_path)).parent)
+    current_path = env.get("PATH", "")
+    path_entries = current_path.split(os.pathsep) if current_path else []
+    if path_entries and path_entries[0] == executable_dir:
+        return
+    if executable_dir in path_entries:
+        path_entries = [entry for entry in path_entries if entry != executable_dir]
+    path_entries.insert(0, executable_dir)
+    env["PATH"] = os.pathsep.join(path_entries)
 
 
 def read_json_url(url: str, *, timeout_seconds: int) -> dict[str, Any]:
@@ -334,6 +413,8 @@ def resolve_launch_mode(args: argparse.Namespace) -> str:
         return "ollama-server"
     if backend == "vllm":
         return "vllm-server"
+    if backend == "sglang":
+        return "sglang-server"
     if backend == "python-hf":
         return "python-hf-probe"
     raise WorkerError(f"Unsupported backend {backend!r}")
@@ -648,6 +729,7 @@ class VllmAdapter:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
+        prepend_executable_dir_to_path(env, python_executable)
         write_session_payload(
             session_path,
             WorkerSession(
@@ -710,6 +792,182 @@ class VllmAdapter:
         return session
 
 
+class SglangAdapter:
+    name = "sglang-server"
+
+    def launch(self, args: argparse.Namespace, session_dir: Path) -> WorkerSession:
+        gpu_indices = resolve_gpu_indices(args)
+        if args.tensor_parallel_size != len(gpu_indices):
+            raise WorkerError(
+                f"tensor_parallel_size={args.tensor_parallel_size} requires exactly "
+                f"{args.tensor_parallel_size} GPUs, but gpu_indices={gpu_indices}"
+            )
+        python_executable = expand_path_text(args.python_executable)
+        port_base = args.port_base or DEFAULT_SGLANG_PORT_BASE
+        port = choose_runtime_port_for_group(port_base, gpu_indices)
+        conflict = find_conflicting_session(
+            session_dir,
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            listen_port=port,
+        )
+        if conflict is not None:
+            raise WorkerError(
+                f"GPU group {list(gpu_indices)} on {args.node_id} already has an active session for "
+                f"agent {conflict.get('agent_id')!r}"
+            )
+
+        session_path, stdout_log, stderr_log = resolve_session_paths(session_dir, args.agent_id)
+        endpoint_url = f"http://{args.server_host}:{port}"
+        health_candidates = [f"{endpoint_url}/health", f"{endpoint_url}/v1/models"]
+        existing = load_session_payload(session_path)
+        command = build_sglang_server_command(
+            python_executable=python_executable,
+            launch_module=args.sglang_launch_module,
+            host=args.server_host,
+            port=port,
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            mem_fraction_static=args.mem_fraction_static,
+            context_length=args.context_length,
+            trust_remote_code=args.trust_remote_code,
+            enable_p2p_check=args.enable_p2p_check,
+            disable_custom_all_reduce=args.disable_custom_all_reduce,
+            disable_overlap_schedule=args.disable_overlap_schedule,
+        )
+        if (
+            existing is not None
+            and existing.get("listen_port") == port
+            and existing.get("endpoint_url") == endpoint_url
+            and session_payload_gpu_indices(existing) == gpu_indices
+            and session_payload_tensor_parallel_size(existing) == args.tensor_parallel_size
+            and str(existing.get("status")) in SESSION_OK_STATUSES
+        ):
+            try:
+                ready_url, _ = wait_for_json_endpoint(
+                    health_candidates,
+                    startup_timeout_seconds=3,
+                    request_timeout_seconds=2,
+                )
+                session = WorkerSession(
+                    status="reused",
+                    agent_id=args.agent_id,
+                    node_id=args.node_id,
+                    backend=args.backend,
+                    runtime_class=args.runtime_class,
+                    model=args.model,
+                    gpu_index=args.gpu_index,
+                    gpu_indices=gpu_indices,
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    single_gpu_only=len(gpu_indices) == 1,
+                    launched_at=utc_timestamp(),
+                    session_file=str(session_path),
+                    endpoint_url=endpoint_url,
+                    listen_port=port,
+                    server_pid=(
+                        int(existing["server_pid"]) if existing.get("server_pid") is not None else None
+                    ),
+                    stdout_log=str(stdout_log),
+                    stderr_log=str(stderr_log),
+                    command=command,
+                    health_url=ready_url,
+                    reused=True,
+                    notes="Reused an existing dedicated SGLang runtime for this agent.",
+                )
+                write_session_payload(session_path, session.to_dict())
+                return session
+            except (WorkerError, error.URLError, json.JSONDecodeError):
+                pass
+        try:
+            wait_for_json_endpoint(
+                health_candidates,
+                startup_timeout_seconds=1,
+                request_timeout_seconds=1,
+            )
+            raise WorkerError(
+                f"SGLang endpoint {endpoint_url} is already live without a reusable session record"
+            )
+        except WorkerError as exc:
+            if "already live" in str(exc):
+                raise
+        except (error.URLError, json.JSONDecodeError):
+            pass
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
+        prepend_executable_dir_to_path(env, python_executable)
+        cuda_home = (
+            env.get("CUDA_HOME")
+            or env.get("CUDA_PATH")
+            or infer_packaged_cuda_home(python_executable)
+        )
+        if cuda_home is not None:
+            env.setdefault("CUDA_HOME", cuda_home)
+            env.setdefault("CUDA_PATH", cuda_home)
+        write_session_payload(
+            session_path,
+            WorkerSession(
+                status="starting",
+                agent_id=args.agent_id,
+                node_id=args.node_id,
+                backend=args.backend,
+                runtime_class=args.runtime_class,
+                model=args.model,
+                gpu_index=args.gpu_index,
+                gpu_indices=gpu_indices,
+                tensor_parallel_size=args.tensor_parallel_size,
+                single_gpu_only=len(gpu_indices) == 1,
+                launched_at=utc_timestamp(),
+                session_file=str(session_path),
+                endpoint_url=endpoint_url,
+                listen_port=port,
+                stdout_log=str(stdout_log),
+                stderr_log=str(stderr_log),
+                command=command,
+                health_url=health_candidates[0],
+                notes="Dedicated SGLang runtime is starting.",
+            ).to_dict(),
+        )
+
+        server_pid = start_background_process(
+            command,
+            env=env,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+        )
+        ready_url, _ = wait_for_json_endpoint(
+            health_candidates,
+            startup_timeout_seconds=args.startup_timeout_seconds,
+            request_timeout_seconds=min(args.request_timeout_seconds, 10),
+        )
+        session = WorkerSession(
+            status="launched",
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            backend=args.backend,
+            runtime_class=args.runtime_class,
+            model=args.model,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            tensor_parallel_size=args.tensor_parallel_size,
+            single_gpu_only=len(gpu_indices) == 1,
+            launched_at=utc_timestamp(),
+            session_file=str(session_path),
+            endpoint_url=endpoint_url,
+            listen_port=port,
+            server_pid=server_pid,
+            stdout_log=str(stdout_log),
+            stderr_log=str(stderr_log),
+            command=command,
+            health_url=ready_url,
+            notes="Dedicated SGLang server launched and passed a health probe.",
+        )
+        write_session_payload(session_path, session.to_dict())
+        return session
+
+
 class PythonHfProbeAdapter:
     name = "python-hf-probe"
 
@@ -723,6 +981,7 @@ class PythonHfProbeAdapter:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
+        prepend_executable_dir_to_path(env, python_executable)
         command = [
             python_executable,
             script_path,
@@ -777,6 +1036,7 @@ _RUNTIME_ADAPTERS: dict[str, RuntimeAdapter] = {
     for adapter in (
         OllamaAdapter(),
         VllmAdapter(),
+        SglangAdapter(),
         PythonHfProbeAdapter(),
     )
 }
@@ -801,6 +1061,9 @@ __all__ = [
     "DEFAULT_SERVER_HOST",
     "DEFAULT_SESSION_DIR",
     "DEFAULT_STARTUP_TIMEOUT_SECONDS",
+    "DEFAULT_SGLANG_LAUNCH_MODULE",
+    "DEFAULT_SGLANG_PORT_BASE",
+    "DEFAULT_MEM_FRACTION_STATIC",
     "DEFAULT_VLLM_LAUNCH_MODULE",
     "DEFAULT_VLLM_PORT_BASE",
     "DEFAULT_WARMUP_PROMPT",
@@ -808,6 +1071,7 @@ __all__ = [
     "WorkerError",
     "WorkerSession",
     "build_ollama_server_command",
+    "build_sglang_server_command",
     "build_vllm_server_command",
     "choose_runtime_port",
     "choose_runtime_port_for_group",
@@ -815,9 +1079,11 @@ __all__ = [
     "expand_path_text",
     "find_conflicting_session",
     "get_runtime_adapter",
+    "infer_packaged_cuda_home",
     "launch_with_adapter",
     "load_session_payload",
     "post_json",
+    "prepend_executable_dir_to_path",
     "read_json_url",
     "resolve_gpu_indices",
     "resolve_launch_mode",

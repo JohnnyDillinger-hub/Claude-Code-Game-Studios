@@ -10,9 +10,11 @@ from urllib import error
 
 from cluster.orchestrator.runtime_adapters import (
     DEFAULT_MAX_NEW_TOKENS,
+    DEFAULT_MEM_FRACTION_STATIC,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SERVER_HOST,
     DEFAULT_SESSION_DIR,
+    DEFAULT_SGLANG_LAUNCH_MODULE,
     DEFAULT_STARTUP_TIMEOUT_SECONDS,
     DEFAULT_VLLM_LAUNCH_MODULE,
     DEFAULT_WARMUP_PROMPT,
@@ -20,6 +22,7 @@ from cluster.orchestrator.runtime_adapters import (
     WorkerError,
     WorkerSession,
     build_ollama_server_command,
+    build_sglang_server_command,
     build_vllm_server_command,
     choose_runtime_port,
     expand_path_text,
@@ -48,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--launch-mode",
         default="auto",
-        choices=("auto", "ollama-server", "vllm-server", "python-hf-probe"),
+        choices=("auto", "ollama-server", "vllm-server", "sglang-server", "python-hf-probe"),
     )
     parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
     parser.add_argument("--server-host", default=DEFAULT_SERVER_HOST)
@@ -69,9 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python-executable", default="python3")
     parser.add_argument("--script-path")
     parser.add_argument("--vllm-launch-module", default=DEFAULT_VLLM_LAUNCH_MODULE)
+    parser.add_argument("--sglang-launch-module", default=DEFAULT_SGLANG_LAUNCH_MODULE)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--mem-fraction-static", type=float, default=DEFAULT_MEM_FRACTION_STATIC)
     parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--context-length", type=int)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--enable-p2p-check", action="store_true")
+    parser.add_argument("--disable-custom-all-reduce", action="store_true")
+    parser.add_argument("--disable-overlap-schedule", action="store_true")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     return parser
 
@@ -82,6 +92,10 @@ def launch_ollama_worker(args: argparse.Namespace, session_dir: Path) -> WorkerS
 
 def launch_vllm_worker(args: argparse.Namespace, session_dir: Path) -> WorkerSession:
     return get_runtime_adapter("vllm-server").launch(args, session_dir)
+
+
+def launch_sglang_worker(args: argparse.Namespace, session_dir: Path) -> WorkerSession:
+    return get_runtime_adapter("sglang-server").launch(args, session_dir)
 
 
 def launch_python_hf_probe(args: argparse.Namespace, session_dir: Path) -> WorkerSession:

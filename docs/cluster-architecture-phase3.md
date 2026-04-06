@@ -11,16 +11,17 @@ shapes:
 
 - `ollama-server`
 - `vllm-server`
+- `sglang-server`
 - `python-hf-probe`
 
 ## Runtime Model
 
 ### Dedicated backend server
 
-For `ollama` and `vllm`, Phase 3 launches a dedicated backend process per agent.
-For Ollama this remains one GPU per agent. For vLLM, Phase 3 can now also
-launch a single-node tensor-parallel worker that reserves multiple GPUs on the
-same node.
+For `ollama`, `vllm`, and `sglang`, Phase 3 launches a dedicated backend process
+per agent. For Ollama this remains one GPU per agent. For `vllm` and `sglang`,
+Phase 3 can now also launch a single-node tensor-parallel worker that reserves
+multiple GPUs on the same node.
 
 - one agent
 - one target node

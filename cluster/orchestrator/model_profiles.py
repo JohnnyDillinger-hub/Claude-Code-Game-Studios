@@ -33,6 +33,8 @@ def infer_runtime_adapter(preferred_backend: str, launch_metadata: dict[str, Any
         return "ollama-server"
     if backend == "vllm":
         return "vllm-server"
+    if backend == "sglang":
+        return "sglang-server"
     if backend == "python-hf":
         return "python-hf-probe"
     return backend

@@ -148,11 +148,34 @@ def build_worker_command(
     )
     _append_optional_arg(
         command,
+        "--sglang-launch-module",
+        launch_metadata.get("sglang_launch_module"),
+    )
+    _append_optional_arg(
+        command,
         "--gpu-memory-utilization",
         launch_metadata.get("gpu_memory_utilization"),
     )
+    _append_optional_arg(
+        command,
+        "--mem-fraction-static",
+        launch_metadata.get("mem_fraction_static"),
+    )
     _append_optional_arg(command, "--max-model-len", launch_metadata.get("max_model_len"))
+    _append_optional_arg(command, "--context-length", launch_metadata.get("context_length"))
     _append_boolean_flag(command, "--enforce-eager", launch_metadata.get("enforce_eager"))
+    _append_boolean_flag(command, "--trust-remote-code", launch_metadata.get("trust_remote_code"))
+    _append_boolean_flag(command, "--enable-p2p-check", launch_metadata.get("enable_p2p_check"))
+    _append_boolean_flag(
+        command,
+        "--disable-custom-all-reduce",
+        launch_metadata.get("disable_custom_all_reduce"),
+    )
+    _append_boolean_flag(
+        command,
+        "--disable-overlap-schedule",
+        launch_metadata.get("disable_overlap_schedule"),
+    )
     _append_optional_arg(
         command,
         "--tensor-parallel-size",
