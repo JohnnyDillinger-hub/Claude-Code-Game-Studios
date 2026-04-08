@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 import io
+import argparse
 from unittest.mock import patch
 
 from cluster.models import (
@@ -29,7 +30,7 @@ from cluster.orchestrator.remote_worker import (
     choose_runtime_port,
     find_conflicting_session,
 )
-from cluster.orchestrator.runtime_adapters import infer_packaged_cuda_home
+from cluster.orchestrator.runtime_adapters import TrtllmAdapter, infer_packaged_cuda_home
 from cluster.orchestrator.runtime_adapters import infer_packaged_library_dirs
 from cluster.orchestrator.runtime_adapters import prepend_env_path_entries, prepend_executable_dir_to_path
 from cluster.orchestrator.registry import NodeRegistry
@@ -652,6 +653,65 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(payload["placement"]["source"], "remote")
         self.assertEqual(payload["launch"]["mode"], "remote-ssh")
 
+    def test_trtllm_launch_writes_starting_session_with_server_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir) / "sessions"
+            bin_dir = Path(tmpdir) / "bin"
+            bin_dir.mkdir()
+            executable = bin_dir / "trtllm-serve"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+            args = argparse.Namespace(
+                agent_id="trt-agent",
+                node_id="node-a",
+                backend="tensorrt-llm",
+                runtime_class="remote-runtime",
+                model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                gpu_index=0,
+                gpu_indices="0,1",
+                tensor_parallel_size=2,
+                pipeline_parallel_size=1,
+                trtllm_executable=str(executable),
+                trtllm_backend="pytorch",
+                trtllm_tokenizer=None,
+                trtllm_max_batch_size=None,
+                trtllm_max_num_tokens=None,
+                trtllm_max_seq_len=None,
+                trtllm_log_level="info",
+                port_base=20000,
+                server_host="127.0.0.1",
+                startup_timeout_seconds=30,
+                request_timeout_seconds=30,
+            )
+
+            writes: list[dict[str, object]] = []
+
+            def capture_write(_path: Path, payload: dict[str, object]) -> None:
+                writes.append(dict(payload))
+
+            with (
+                patch(
+                    "cluster.orchestrator.runtime_adapters.start_background_process",
+                    return_value=4321,
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.wait_for_json_endpoint_or_process_exit",
+                    return_value=("http://127.0.0.1:20000/health", {}),
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.write_session_payload",
+                    side_effect=capture_write,
+                ),
+            ):
+                session = TrtllmAdapter().launch(args, session_dir)
+
+        self.assertEqual(session.server_pid, 4321)
+        self.assertGreaterEqual(len(writes), 2)
+        self.assertEqual(writes[0]["status"], "starting")
+        self.assertEqual(writes[0]["server_pid"], 4321)
+        self.assertEqual(writes[-1]["status"], "launched")
+        self.assertEqual(writes[-1]["server_pid"], 4321)
+
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             session_dir = Path(tmpdir)
@@ -791,6 +851,27 @@ class ClusterPhase3Tests(unittest.TestCase):
             claims = collect_session_claims(session_dir)
 
         self.assertEqual([claim.gpu_index for claim in claims], [0, 1])
+
+    def test_collect_session_claims_ignores_dead_server_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            (session_dir / "dead.json").write_text(
+                json.dumps(
+                    {
+                        "status": "starting",
+                        "agent_id": "dead-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 0,
+                        "server_pid": 4242,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("cluster.orchestrator.remote_sessions.os.kill", side_effect=ProcessLookupError):
+                claims = collect_session_claims(session_dir)
+
+        self.assertEqual(claims, [])
 
     def test_filter_nodes_by_remote_session_claims_removes_conflicting_gpus(self) -> None:
         nodes = [

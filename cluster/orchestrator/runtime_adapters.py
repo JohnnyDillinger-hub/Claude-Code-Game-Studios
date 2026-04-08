@@ -1237,6 +1237,14 @@ class TrtllmAdapter:
         packaged_cuda_home = infer_packaged_cuda_home(trtllm_executable)
         if packaged_cuda_home is not None:
             env["CUDA_HOME"] = packaged_cuda_home
+        launched_at = utc_timestamp()
+
+        server_pid = start_background_process(
+            command,
+            env=env,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+        )
         write_session_payload(
             session_path,
             WorkerSession(
@@ -1250,23 +1258,17 @@ class TrtllmAdapter:
                 gpu_indices=gpu_indices,
                 tensor_parallel_size=args.tensor_parallel_size,
                 single_gpu_only=len(gpu_indices) == 1,
-                launched_at=utc_timestamp(),
+                launched_at=launched_at,
                 session_file=str(session_path),
                 endpoint_url=endpoint_url,
                 listen_port=port,
+                server_pid=server_pid,
                 stdout_log=str(stdout_log),
                 stderr_log=str(stderr_log),
                 command=command,
                 health_url=health_candidates[0],
                 notes="Dedicated TensorRT-LLM runtime is starting.",
             ).to_dict(),
-        )
-
-        server_pid = start_background_process(
-            command,
-            env=env,
-            stdout_log=stdout_log,
-            stderr_log=stderr_log,
         )
         ready_url, _ = wait_for_json_endpoint_or_process_exit(
             health_candidates,
@@ -1287,7 +1289,7 @@ class TrtllmAdapter:
             gpu_indices=gpu_indices,
             tensor_parallel_size=args.tensor_parallel_size,
             single_gpu_only=len(gpu_indices) == 1,
-            launched_at=utc_timestamp(),
+            launched_at=launched_at,
             session_file=str(session_path),
             endpoint_url=endpoint_url,
             listen_port=port,

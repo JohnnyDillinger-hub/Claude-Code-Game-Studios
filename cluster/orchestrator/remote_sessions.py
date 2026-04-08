@@ -104,9 +104,32 @@ def payload_to_claim(payload: dict[str, Any]) -> RemoteSessionClaim | None:
     )
 
 
+def _payload_process_is_alive(payload: dict[str, Any]) -> bool:
+    server_pid = payload.get("server_pid")
+    if server_pid is None:
+        return True
+    try:
+        pid = int(server_pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def collect_session_claims(session_dir: Path) -> list[RemoteSessionClaim]:
     claims: list[RemoteSessionClaim] = []
     for payload in list_session_payloads(session_dir):
+        if not _payload_process_is_alive(payload):
+            continue
         template = payload_to_claim(payload)
         if template is None:
             continue
