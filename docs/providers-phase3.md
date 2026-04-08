@@ -36,6 +36,7 @@ Current provider commands in [clusterctl.py](/Users/ivandry/GitHub/Claude-Code-G
 - `providers-list-blueprints`
 - `providers-provision`
 - `providers-jobs`
+- `providers-reconcile-jobs`
 
 ## Discovery Vs Provisioning Vs Joining
 
@@ -55,8 +56,9 @@ Provisioning:
 
 Joining:
 
-- Is not automatic yet.
-- Will happen when the created VM or Pod starts the existing node agent and heartbeats into the registry.
+- Still depends on the existing node agent starting and heartbeating into the registry.
+- Can now be confirmed from provider jobs through `providers-reconcile-jobs`.
+- Marks the job as `joined`, captures the matched `node_id`, and stores a snapshot of the joined node.
 - Only after that does the resource become `NodeInventory` and participate in scheduling.
 
 ## What Is Deferred
@@ -69,7 +71,7 @@ This phase intentionally does not implement:
 - full secret management UX
 - automatic NAT traversal
 - full provider create flows in production mode for `runpod` and `nebius`
-- cluster join confirmation from provider jobs
+- automatic waiting/polling for cluster join after provisioning
 
 ## Managed Vs Bring Your Own Provider
 

@@ -411,6 +411,9 @@ class ProvisionJob:
     selected_offer: ProviderOffer | None = None
     bootstrap_bundle: BootstrapBundle | None = None
     provisioned_resource: ProvisionedResource | None = None
+    joined_node_id: str | None = None
+    joined_at: datetime | None = None
+    joined_node_snapshot: dict[str, Any] = field(default_factory=dict)
     error_code: str | None = None
     error_message: str | None = None
 
@@ -428,6 +431,12 @@ class ProvisionJob:
             payload["bootstrap_bundle"] = self.bootstrap_bundle.to_dict()
         if self.provisioned_resource is not None:
             payload["provisioned_resource"] = self.provisioned_resource.to_dict()
+        if self.joined_node_id is not None:
+            payload["joined_node_id"] = self.joined_node_id
+        if self.joined_at is not None:
+            payload["joined_at"] = format_datetime(self.joined_at)
+        if self.joined_node_snapshot:
+            payload["joined_node_snapshot"] = self.joined_node_snapshot
         if self.error_code is not None:
             payload["error_code"] = self.error_code
         if self.error_message is not None:
@@ -457,7 +466,15 @@ class ProvisionJob:
                 if isinstance(payload.get("provisioned_resource"), Mapping)
                 else None
             ),
+            joined_node_id=(
+                str(payload["joined_node_id"]) if payload.get("joined_node_id") is not None else None
+            ),
+            joined_at=(
+                parse_datetime(str(payload["joined_at"]))
+                if payload.get("joined_at") is not None
+                else None
+            ),
+            joined_node_snapshot=_dict_copy(payload.get("joined_node_snapshot")),
             error_code=str(payload["error_code"]) if payload.get("error_code") else None,
             error_message=str(payload["error_message"]) if payload.get("error_message") else None,
         )
-

@@ -777,6 +777,14 @@ def build_parser() -> argparse.ArgumentParser:
     provider_jobs_parser.add_argument("--job-id")
     provider_jobs_parser.add_argument("--status")
 
+    provider_reconcile_parser = subparsers.add_parser(
+        "providers-reconcile-jobs",
+        help="Refresh provider provisioning jobs against the active cluster registry.",
+    )
+    provider_reconcile_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
+    provider_reconcile_parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
+    provider_reconcile_parser.add_argument("--job-id")
+
     save_parser = subparsers.add_parser("save-registry", help="Save registry state to disk.")
     save_parser.add_argument("--local-file")
     save_parser.add_argument("--remote-file")
@@ -1219,6 +1227,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
             return 0
         jobs = service.list_jobs(status=args.status)
+        print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "providers-reconcile-jobs":
+        service = ProviderService(jobs_file=args.jobs_file)
+        jobs = service.reconcile_jobs_from_state_file(args.state_file)
+        if args.job_id:
+            for job in jobs:
+                if job.job_id == args.job_id:
+                    print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
+                    return 0
+            print(
+                json.dumps(
+                    {"status": "not_found", "job_id": args.job_id},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
         print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
         return 0
 

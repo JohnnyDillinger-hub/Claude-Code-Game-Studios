@@ -38,7 +38,8 @@ These objects are intentionally separate from [NodeInventory](/Users/ivandry/Git
 1. `providers-list-offers` asks provider adapters for normalized capacity.
 2. `providers-list-blueprints` exposes built-in presets.
 3. `providers-provision` validates a request, picks an offer, creates a provisioning job, and emits a bootstrap bundle.
-4. The created external resource is still outside the mesh until node-agent heartbeat happens.
+4. `providers-reconcile-jobs` matches provisioning jobs back to the cluster registry by generated `node_id`.
+5. The created external resource is still outside the mesh until node-agent heartbeat happens.
 
 ## Bootstrap Strategy
 
@@ -70,11 +71,14 @@ The provider layer does not:
 - launch runtime backends
 - mark nodes active in the registry by itself
 
+It can, however, confirm that a provisioned resource has become a joined mesh
+node by reconciling provider jobs against the existing registry state.
+
 That separation keeps the existing cluster orchestration stable while we add provider-backed capacity.
 
 ## Recommended Next Steps
 
-1. Add bootstrap execution and heartbeat confirmation after real `Vast` create.
+1. Add automatic waiting and polling after real `Vast` create so a job can move from `bootstrapping` to `joined` without a separate manual reconcile step.
 2. Port the same real create pattern to `runpod`.
 3. Expose the same provider service through a thin HTTP API for the GUI.
 4. Add policy controls only after provisioning and joining are reliable.

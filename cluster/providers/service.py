@@ -8,6 +8,8 @@ import secrets
 from typing import Iterable
 
 from cluster.models import utc_now
+from cluster.orchestrator.registry import NodeRegistry
+from cluster.orchestrator.state_store import RegistryStateStore
 from cluster.providers.base import ProviderAdapter, ProviderError
 from cluster.providers.blueprints import load_builtin_blueprints
 from cluster.providers.job_store import ProvisionJobStore
@@ -230,6 +232,15 @@ class ProviderService:
                 return job
         return None
 
+    def reconcile_jobs(self, registry: NodeRegistry) -> list[ProvisionJob]:
+        reconciled = [self._reconcile_job(job, registry) for job in self.jobs.load()]
+        self.jobs.save(reconciled)
+        return reconciled
+
+    def reconcile_jobs_from_state_file(self, state_file: str | Path) -> list[ProvisionJob]:
+        registry = RegistryStateStore(state_file).load()
+        return self.reconcile_jobs(registry)
+
     def _apply_blueprint_defaults(
         self,
         request: ProvisionRequest,
@@ -261,6 +272,31 @@ class ProviderService:
             trust_tier=request.trust_tier or blueprint.trust_tier,
             network_tier=request.network_tier or blueprint.network_tier,
             provider_options=provider_options,
+        )
+
+    def _reconcile_job(self, job: ProvisionJob, registry: NodeRegistry) -> ProvisionJob:
+        if job.status == "failed" or job.bootstrap_bundle is None:
+            return job
+        node_id = job.bootstrap_bundle.node_id
+        record = registry.get_record(node_id)
+        if record is None:
+            return job
+        now = utc_now()
+        if record.node.is_expired(now=now):
+            return job
+
+        resource = job.provisioned_resource
+        if resource is not None and resource.status != "joined":
+            resource = replace(resource, status="joined")
+        joined_at = job.joined_at or record.last_heartbeat_at or now
+        return replace(
+            job,
+            status="joined",
+            updated_at=now,
+            provisioned_resource=resource,
+            joined_node_id=node_id,
+            joined_at=joined_at,
+            joined_node_snapshot=record.node.to_dict(),
         )
 
     def _resolve_blueprint(self, request: ProvisionRequest) -> ProviderBlueprint | None:

@@ -8,8 +8,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from cluster.models import LeaseInfo, NodeInventory, parse_datetime
 from cluster.orchestrator.clusterctl import main as clusterctl_main
 from cluster.orchestrator.registry import NodeRegistry
+from cluster.orchestrator.state_store import RegistryStateStore
 from cluster.providers.blueprints import load_builtin_blueprints
 from cluster.providers.job_store import ProvisionJobStore
 from cluster.providers.models import ProviderOffer, ProvisionRequest
@@ -208,6 +210,55 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(job.selected_offer.offer_id, "offer-manual-123")
         self.assertEqual(job.provisioned_resource.offer_id, "offer-manual-123")
 
+    def test_provider_service_reconciles_job_when_node_joins_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = ProviderService(jobs_file=Path(tmpdir) / "jobs.json")
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+            assert job.bootstrap_bundle is not None
+            registry = NodeRegistry()
+            registry.register(
+                NodeInventory(
+                    node_id=job.bootstrap_bundle.node_id,
+                    host="198.51.100.25",
+                    lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+                )
+            )
+
+            reconciled_jobs = service.reconcile_jobs(registry)
+
+        self.assertEqual(len(reconciled_jobs), 1)
+        updated = reconciled_jobs[0]
+        self.assertEqual(updated.status, "joined")
+        self.assertEqual(updated.joined_node_id, job.bootstrap_bundle.node_id)
+        self.assertIsNotNone(updated.joined_at)
+        self.assertEqual(updated.joined_node_snapshot["node_id"], job.bootstrap_bundle.node_id)
+        assert updated.provisioned_resource is not None
+        self.assertEqual(updated.provisioned_resource.status, "joined")
+
+    def test_provider_service_leaves_job_bootstrapping_when_node_not_joined(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = ProviderService(jobs_file=Path(tmpdir) / "jobs.json")
+            job = service.provision(
+                ProvisionRequest(
+                    provider="nebius",
+                    blueprint_id="trusted-nebius-worker",
+                    dry_run=True,
+                )
+            )
+
+            reconciled_jobs = service.reconcile_jobs(NodeRegistry())
+
+        self.assertEqual(len(reconciled_jobs), 1)
+        self.assertEqual(reconciled_jobs[0].job_id, job.job_id)
+        self.assertEqual(reconciled_jobs[0].status, "bootstrapping")
+        self.assertIsNone(reconciled_jobs[0].joined_node_id)
+
     def test_vast_adapter_real_create_normalizes_created_instance(self) -> None:
         adapter = VastAdapter(api_key="test-token")
         service = ProviderService(adapters=(adapter,))
@@ -268,3 +319,55 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(put_payload["runtype"], "ssh_direct")
         self.assertIn("cluster.node_agent.daemon", put_payload["onstart"])
         self.assertEqual(get_json.call_args.args[0], "https://console.vast.ai/api/v0/instances/99123/")
+
+    def test_clusterctl_reconciles_provider_jobs_against_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "provider-jobs.json"
+            state_file = Path(tmpdir) / "cluster-registry.json"
+
+            create_buffer = io.StringIO()
+            with redirect_stdout(create_buffer):
+                create_exit_code = clusterctl_main(
+                    [
+                        "providers-provision",
+                        "--provider",
+                        "vast",
+                        "--blueprint",
+                        "qwen-coder-node-vast",
+                        "--dry-run",
+                        "--jobs-file",
+                        str(jobs_file),
+                    ]
+                )
+            created = json.loads(create_buffer.getvalue())
+            registry = NodeRegistry()
+            registry.register(
+                NodeInventory(
+                    node_id=created["bootstrap_bundle"]["node_id"],
+                    host="203.0.113.55",
+                    lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+                )
+            )
+            RegistryStateStore(state_file).save(registry)
+
+            reconcile_buffer = io.StringIO()
+            with redirect_stdout(reconcile_buffer):
+                reconcile_exit_code = clusterctl_main(
+                    [
+                        "providers-reconcile-jobs",
+                        "--jobs-file",
+                        str(jobs_file),
+                        "--state-file",
+                        str(state_file),
+                        "--job-id",
+                        created["job_id"],
+                    ]
+                )
+            reconciled = json.loads(reconcile_buffer.getvalue())
+            persisted = ProvisionJobStore(jobs_file).load()[0]
+
+        self.assertEqual(create_exit_code, 0)
+        self.assertEqual(reconcile_exit_code, 0)
+        self.assertEqual(reconciled["status"], "joined")
+        self.assertEqual(reconciled["joined_node_id"], created["bootstrap_bundle"]["node_id"])
+        self.assertEqual(persisted.status, "joined")
