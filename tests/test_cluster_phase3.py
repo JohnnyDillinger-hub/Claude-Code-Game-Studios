@@ -8,7 +8,16 @@ from contextlib import redirect_stdout
 import io
 from unittest.mock import patch
 
-from cluster.models import AgentRequest, GPUInventory, LeaseInfo, NodeInventory, PlacementDecision, parse_datetime
+from cluster.models import (
+    AgentDeploymentSpec,
+    AgentRequest,
+    GPUInventory,
+    LeaseInfo,
+    NodeInventory,
+    PlacementDecision,
+    RuntimeLaunchPreferences,
+    parse_datetime,
+)
 from cluster.orchestrator.clusterctl import _filter_nodes_by_remote_session_claims, main as clusterctl_main
 from cluster.orchestrator.launcher import build_worker_command, launch_agent
 from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
@@ -261,6 +270,27 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--cuda-graph-max-bs", command)
         self.assertIn("32", command)
 
+    def test_agent_deployment_spec_roundtrip_preserves_launch_preferences(self) -> None:
+        spec = AgentDeploymentSpec(
+            agent_id="agent-ui-1",
+            profile="qwen-coder-30b-sglang-tp2",
+            required_vram_mib=30000,
+            required_gpu_count=2,
+            model_id="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            labels=(("role", "coder"),),
+            trust_tier="burst",
+            network_tier="public",
+            launch_preferences=RuntimeLaunchPreferences(
+                cuda_graph_mode="enabled",
+                cuda_graph_max_bs=32,
+            ),
+        )
+
+        restored = AgentDeploymentSpec.from_dict(spec.to_dict())
+
+        self.assertEqual(restored.to_dict(), spec.to_dict())
+        self.assertEqual(restored.to_agent_request().required_gpu_count, 2)
+
     def test_vllm_server_command_and_port_are_single_gpu_deterministic(self) -> None:
         command = build_vllm_server_command(
             python_executable="python3",
@@ -356,6 +386,60 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(
             env["PATH"].split(":")[0],
             "/tmp/.venv-sglang/bin",
+        )
+
+    def test_launch_agent_dry_run_emits_deployment_spec(self) -> None:
+        local_node = NodeInventory(
+            node_id="local-node",
+            host="127.0.0.1",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 16000, total_mib=16384),),
+        )
+        remote_node = NodeInventory(
+            node_id="remote-sg",
+            host="10.0.0.62",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 32100, total_mib=32607), make_gpu(1, 32100, total_mib=32607)),
+            cached_models=("Qwen/Qwen3-Coder-30B-A3B-Instruct",),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = Path(tmpdir) / "local.json"
+            remote_path = Path(tmpdir) / "remote.json"
+            local_path.write_text(json.dumps([local_node.to_dict()]), encoding="utf-8")
+            remote_path.write_text(json.dumps([remote_node.to_dict()]), encoding="utf-8")
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "launch-agent",
+                        "--local-file",
+                        str(local_path),
+                        "--remote-file",
+                        str(remote_path),
+                        "--local-node-id",
+                        "local-node",
+                        "--agent-id",
+                        "agent-ui-launch",
+                        "--profile",
+                        "qwen-coder-30b-sglang-tp2",
+                        "--cuda-graph-mode",
+                        "enabled",
+                        "--cuda-graph-max-bs",
+                        "32",
+                        "--dry-run",
+                    ]
+                )
+        payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["deployment"]["profile"], "qwen-coder-30b-sglang-tp2")
+        self.assertEqual(
+            payload["deployment"]["launch_preferences"]["cuda_graph_mode"],
+            "enabled",
+        )
+        self.assertEqual(
+            payload["deployment"]["launch_preferences"]["cuda_graph_max_bs"],
+            32,
         )
 
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:

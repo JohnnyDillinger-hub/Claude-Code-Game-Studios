@@ -62,6 +62,10 @@ This lets the client keep the profile default for a known-good node, or
 explicitly force the runtime to start with or without CUDA graph capture for a
 particular launch.
 
+`launch-agent` now also emits a top-level `deployment` object in its JSON
+response. This gives the future client API a stable, serializable contract for
+the requested profile, placement constraints, and launch preferences.
+
 ### Python / Hugging Face
 
 For `python-hf` profiles, the worker runs a one-shot probe on the target GPU and

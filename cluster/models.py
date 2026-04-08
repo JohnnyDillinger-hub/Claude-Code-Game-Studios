@@ -42,6 +42,9 @@ def _string_tuple(values: Iterable[str] | None) -> tuple[str, ...]:
     return tuple(str(value) for value in values)
 
 
+CUDA_GRAPH_MODE_VALUES = ("profile-default", "enabled", "disabled")
+
+
 @dataclass(frozen=True, slots=True)
 class NodeAccess:
     ssh_user: str | None = None
@@ -403,6 +406,112 @@ class AgentRequest:
             network_tier=(
                 str(payload["network_tier"])
                 if payload.get("network_tier") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLaunchPreferences:
+    cuda_graph_mode: str | None = None
+    cuda_graph_max_bs: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.cuda_graph_mode is not None:
+            payload["cuda_graph_mode"] = self.cuda_graph_mode
+        if self.cuda_graph_max_bs is not None:
+            payload["cuda_graph_max_bs"] = self.cuda_graph_max_bs
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeLaunchPreferences":
+        cuda_graph_mode = (
+            str(payload["cuda_graph_mode"]) if payload.get("cuda_graph_mode") is not None else None
+        )
+        if cuda_graph_mode is not None and cuda_graph_mode not in CUDA_GRAPH_MODE_VALUES:
+            raise ValueError(
+                f"Unsupported cuda_graph_mode {cuda_graph_mode!r}; expected one of {CUDA_GRAPH_MODE_VALUES}"
+            )
+        return cls(
+            cuda_graph_mode=cuda_graph_mode,
+            cuda_graph_max_bs=(
+                int(payload["cuda_graph_max_bs"])
+                if payload.get("cuda_graph_max_bs") is not None
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AgentDeploymentSpec:
+    agent_id: str
+    profile: str
+    required_vram_mib: int
+    required_gpu_count: int = 1
+    model_id: str | None = None
+    labels: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    trust_tier: str | None = None
+    network_tier: str | None = None
+    launch_preferences: RuntimeLaunchPreferences | None = None
+
+    @property
+    def labels_map(self) -> dict[str, str]:
+        return _labels_dict(self.labels)
+
+    def to_agent_request(self) -> AgentRequest:
+        return AgentRequest(
+            agent_id=self.agent_id,
+            required_vram_mib=self.required_vram_mib,
+            required_gpu_count=self.required_gpu_count,
+            model_id=self.model_id,
+            labels=self.labels,
+            trust_tier=self.trust_tier,
+            network_tier=self.network_tier,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "agent_id": self.agent_id,
+            "profile": self.profile,
+            "required_vram_mib": self.required_vram_mib,
+        }
+        if self.required_gpu_count != 1:
+            payload["required_gpu_count"] = self.required_gpu_count
+        if self.model_id is not None:
+            payload["model_id"] = self.model_id
+        if self.labels:
+            payload["labels"] = self.labels_map
+        if self.trust_tier is not None:
+            payload["trust_tier"] = self.trust_tier
+        if self.network_tier is not None:
+            payload["network_tier"] = self.network_tier
+        if self.launch_preferences is not None:
+            payload["launch_preferences"] = self.launch_preferences.to_dict()
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "AgentDeploymentSpec":
+        return cls(
+            agent_id=str(payload["agent_id"]),
+            profile=str(payload["profile"]),
+            required_vram_mib=int(payload["required_vram_mib"]),
+            required_gpu_count=int(payload.get("required_gpu_count", 1)),
+            model_id=str(payload["model_id"]) if payload.get("model_id") else None,
+            labels=_sorted_labels(payload.get("labels")),
+            trust_tier=(
+                str(payload["trust_tier"])
+                if payload.get("trust_tier") is not None
+                else None
+            ),
+            network_tier=(
+                str(payload["network_tier"])
+                if payload.get("network_tier") is not None
+                else None
+            ),
+            launch_preferences=(
+                RuntimeLaunchPreferences.from_dict(payload["launch_preferences"])
+                if payload.get("launch_preferences")
                 else None
             ),
         )

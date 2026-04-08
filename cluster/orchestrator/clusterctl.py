@@ -10,7 +10,15 @@ import sys
 from typing import Sequence
 
 from cluster.demo import LOCAL_NODE_PATH, REMOTE_NODES_PATH
-from cluster.models import AgentRequest, NodeInventory, load_node_inventory_file, utc_now
+from cluster.models import (
+    AgentDeploymentSpec,
+    AgentRequest,
+    CUDA_GRAPH_MODE_VALUES,
+    NodeInventory,
+    RuntimeLaunchPreferences,
+    load_node_inventory_file,
+    utc_now,
+)
 from cluster.node_agent.daemon import main as node_agent_main
 from cluster.node_agent.heartbeat import (
     apply_heartbeat_to_state_file,
@@ -38,7 +46,7 @@ DEFAULT_REMOTE_SESSION_DIR = "production/session-state/remote-workers"
 DEFAULT_REPO_ROOT = "$HOME/Claude-Code-Game-Studios"
 DEFAULT_SSH_USER = "root"
 PROVIDER_CHOICES = ("vast", "runpod", "nebius")
-CUDA_GRAPH_MODE_CHOICES = ("profile-default", "enabled", "disabled")
+CUDA_GRAPH_MODE_CHOICES = CUDA_GRAPH_MODE_VALUES
 
 
 def _resolve_inventory_path(path: str | None, default_path: Path) -> Path:
@@ -122,6 +130,32 @@ def _build_request(args: argparse.Namespace) -> AgentRequest:
     )
 
 
+def _build_launch_preferences(args: argparse.Namespace) -> RuntimeLaunchPreferences | None:
+    cuda_graph_mode = getattr(args, "cuda_graph_mode", "profile-default")
+    cuda_graph_max_bs = getattr(args, "cuda_graph_max_bs", None)
+    if cuda_graph_mode == "profile-default" and cuda_graph_max_bs is None:
+        return None
+    return RuntimeLaunchPreferences(
+        cuda_graph_mode=cuda_graph_mode,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+    )
+
+
+def _build_deployment_spec(args: argparse.Namespace) -> AgentDeploymentSpec:
+    request = _build_request(args)
+    return AgentDeploymentSpec(
+        agent_id=request.agent_id,
+        profile=str(args.profile),
+        required_vram_mib=request.required_vram_mib,
+        required_gpu_count=request.required_gpu_count,
+        model_id=request.model_id,
+        labels=request.labels,
+        trust_tier=request.trust_tier,
+        network_tier=request.network_tier,
+        launch_preferences=_build_launch_preferences(args),
+    )
+
+
 def _parse_provider_options(items: Sequence[str]) -> dict[str, object]:
     parsed: dict[str, object] = {}
     for item in items:
@@ -167,14 +201,15 @@ def _build_provision_request(args: argparse.Namespace) -> ProvisionRequest:
 
 def _apply_launch_profile_overrides(
     profile: RuntimeProfile,
-    args: argparse.Namespace,
+    deployment_spec: AgentDeploymentSpec,
 ) -> RuntimeProfile:
     overrides: dict[str, object] = {}
-    cuda_graph_mode = getattr(args, "cuda_graph_mode", "profile-default")
-    cuda_graph_max_bs = getattr(args, "cuda_graph_max_bs", None)
-    if cuda_graph_mode != "profile-default" or cuda_graph_max_bs is not None:
+    launch_preferences = deployment_spec.launch_preferences
+    if launch_preferences is not None:
         if profile.runtime_adapter != "sglang-server":
             raise ValueError("CUDA graph overrides are currently supported only for SGLang profiles")
+        cuda_graph_mode = launch_preferences.cuda_graph_mode or "profile-default"
+        cuda_graph_max_bs = launch_preferences.cuda_graph_max_bs
         if cuda_graph_mode == "enabled":
             overrides["disable_cuda_graph"] = False
         elif cuda_graph_mode == "disabled":
@@ -915,14 +950,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         remote_nodes = [
             node for node in registry.list_nodes() if node.node_id != local_node.node_id
         ]
-        request = _build_request(args)
-        profile = get_runtime_profile(args.profile)
+        deployment_spec = _build_deployment_spec(args)
+        request = deployment_spec.to_agent_request()
+        profile = get_runtime_profile(deployment_spec.profile)
         try:
-            profile = _apply_launch_profile_overrides(profile, args)
+            profile = _apply_launch_profile_overrides(profile, deployment_spec)
         except ValueError as exc:
             print(
                 json.dumps(
                     {
+                        "deployment": deployment_spec.to_dict(),
                         "launch": {
                             "status": "blocked",
                             "reason": str(exc),
@@ -948,6 +985,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(
                     json.dumps(
                         {
+                            "deployment": deployment_spec.to_dict(),
                             "launch": {
                                 "status": "blocked",
                                 "reason": f"Remote session probe failed: {exc}",
@@ -970,6 +1008,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 json.dumps(
                     {
+                        "deployment": deployment_spec.to_dict(),
                         "placement": decision.to_dict(),
                         "launch": {
                             "status": "blocked",
@@ -1004,6 +1043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(
                 json.dumps(
                     {
+                        "deployment": deployment_spec.to_dict(),
                         "placement": decision.to_dict(),
                         "launch": {
                             "status": "blocked",
@@ -1018,6 +1058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 {
+                    "deployment": deployment_spec.to_dict(),
                     "placement": decision.to_dict(),
                     "launch": result.to_dict(),
                 },
