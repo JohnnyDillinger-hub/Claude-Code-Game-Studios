@@ -189,6 +189,7 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("16384", command)
         self.assertIn("--trust-remote-code", command)
         self.assertIn("--disable-custom-all-reduce", command)
+        self.assertIn("--disable-cuda-graph", command)
 
     def test_build_worker_command_includes_sglang_launch_args_for_tp4_profile(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b-sglang-tp4")
@@ -219,12 +220,13 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--sglang-launch-module", command)
         self.assertIn("sglang.launch_server", command)
         self.assertIn("--mem-fraction-static", command)
-        self.assertIn("0.9", command)
+        self.assertIn("0.88", command)
         self.assertIn("--context-length", command)
-        self.assertIn("32768", command)
+        self.assertIn("16384", command)
         self.assertIn("--tensor-parallel-size", command)
         self.assertIn("4", command)
         self.assertIn("--disable-custom-all-reduce", command)
+        self.assertIn("--disable-cuda-graph", command)
 
     def test_vllm_server_command_and_port_are_single_gpu_deterministic(self) -> None:
         command = build_vllm_server_command(
@@ -259,6 +261,8 @@ class ClusterPhase3Tests(unittest.TestCase):
             context_length=32768,
             trust_remote_code=True,
             disable_custom_all_reduce=True,
+            disable_cuda_graph=True,
+            cuda_graph_max_bs=24,
         )
 
         self.assertEqual(choose_runtime_port(19140, 0), 19140)
@@ -272,6 +276,9 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("32768", command)
         self.assertIn("--trust-remote-code", command)
         self.assertIn("--disable-custom-all-reduce", command)
+        self.assertIn("--disable-cuda-graph", command)
+        self.assertIn("--cuda-graph-max-bs", command)
+        self.assertIn("24", command)
 
     def test_infer_packaged_cuda_home_prefers_packaged_runtime_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

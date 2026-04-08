@@ -176,6 +176,16 @@ def build_worker_command(
         "--disable-overlap-schedule",
         launch_metadata.get("disable_overlap_schedule"),
     )
+    _append_boolean_flag(
+        command,
+        "--disable-cuda-graph",
+        launch_metadata.get("disable_cuda_graph"),
+    )
+    _append_optional_arg(
+        command,
+        "--cuda-graph-max-bs",
+        launch_metadata.get("cuda_graph_max_bs"),
+    )
     _append_optional_arg(
         command,
         "--tensor-parallel-size",

@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable-p2p-check", action="store_true")
     parser.add_argument("--disable-custom-all-reduce", action="store_true")
     parser.add_argument("--disable-overlap-schedule", action="store_true")
+    parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument("--cuda-graph-max-bs", type=int)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     return parser
 

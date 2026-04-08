@@ -188,6 +188,8 @@ def build_sglang_server_command(
     enable_p2p_check: bool = False,
     disable_custom_all_reduce: bool = False,
     disable_overlap_schedule: bool = False,
+    disable_cuda_graph: bool = False,
+    cuda_graph_max_bs: int | None = None,
 ) -> list[str]:
     command = [
         python_executable,
@@ -214,6 +216,10 @@ def build_sglang_server_command(
         command.append("--disable-custom-all-reduce")
     if disable_overlap_schedule:
         command.append("--disable-overlap-schedule")
+    if disable_cuda_graph:
+        command.append("--disable-cuda-graph")
+    if cuda_graph_max_bs is not None:
+        command.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
     return command
 
 
@@ -836,6 +842,8 @@ class SglangAdapter:
             enable_p2p_check=args.enable_p2p_check,
             disable_custom_all_reduce=args.disable_custom_all_reduce,
             disable_overlap_schedule=args.disable_overlap_schedule,
+            disable_cuda_graph=args.disable_cuda_graph,
+            cuda_graph_max_bs=args.cuda_graph_max_bs,
         )
         if (
             existing is not None

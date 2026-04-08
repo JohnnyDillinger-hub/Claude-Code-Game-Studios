@@ -15,6 +15,8 @@ Desktop.ini
 CLAUDE.local.md
 production/session-logs/
 production/session-state/*.md
+production/session-state/*.json
+production/session-state/remote-workers/
 
 # === Internal Planning (not for public) ===
 docs/IMPROVEMENTS-PROPOSAL.md

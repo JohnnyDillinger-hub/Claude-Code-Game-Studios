@@ -188,7 +188,8 @@
         "mem_fraction_static": 0.96,
         "context_length": 16384,
         "trust_remote_code": true,
-        "disable_custom_all_reduce": true
+        "disable_custom_all_reduce": true,
+        "disable_cuda_graph": true
       }
     },
     "qwen-coder-30b-sglang-tp4": {
@@ -211,10 +212,11 @@
         "warmup_prompt": "Reply with exactly READY",
         "max_new_tokens": 8,
         "tensor_parallel_size": 4,
-        "mem_fraction_static": 0.90,
-        "context_length": 32768,
+        "mem_fraction_static": 0.88,
+        "context_length": 16384,
         "trust_remote_code": true,
-        "disable_custom_all_reduce": true
+        "disable_custom_all_reduce": true,
+        "disable_cuda_graph": true
       }
     }
   }

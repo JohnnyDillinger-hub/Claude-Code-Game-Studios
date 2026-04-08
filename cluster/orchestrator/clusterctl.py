@@ -24,12 +24,16 @@ from cluster.orchestrator.remote_sessions import RemoteSessionClaim
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.scheduler import schedule_agent
 from cluster.orchestrator.state_store import RegistryStateStore
+from cluster.providers.base import ProviderError
+from cluster.providers.models import ProvisionRequest
+from cluster.providers.service import DEFAULT_JOBS_FILE, ProviderService
 
 
 DEFAULT_STATE_FILE = Path("production/session-state/cluster-registry.json")
 DEFAULT_REMOTE_SESSION_DIR = "production/session-state/remote-workers"
 DEFAULT_REPO_ROOT = "$HOME/Claude-Code-Game-Studios"
 DEFAULT_SSH_USER = "root"
+PROVIDER_CHOICES = ("vast", "runpod", "nebius")
 
 
 def _resolve_inventory_path(path: str | None, default_path: Path) -> Path:
@@ -110,6 +114,49 @@ def _build_request(args: argparse.Namespace) -> AgentRequest:
         labels=tuple(sorted(labels.items())),
         trust_tier=args.trust_tier,
         network_tier=args.network_tier,
+    )
+
+
+def _parse_provider_options(items: Sequence[str]) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Provider option must use key=value syntax: {item!r}")
+        key, raw_value = item.split("=", 1)
+        normalized = raw_value.strip()
+        lowered = normalized.lower()
+        if lowered in {"true", "false"}:
+            value: object = lowered == "true"
+        else:
+            try:
+                value = int(normalized)
+            except ValueError:
+                try:
+                    value = float(normalized)
+                except ValueError:
+                    value = normalized
+        parsed[key.strip()] = value
+    return parsed
+
+
+def _build_provision_request(args: argparse.Namespace) -> ProvisionRequest:
+    labels = parse_label_items(args.label or [])
+    public_ip: bool | None = True if getattr(args, "public_ip", False) else None
+    return ProvisionRequest(
+        provider=args.provider,
+        blueprint_id=getattr(args, "blueprint", None),
+        offer_id=getattr(args, "offer_id", None),
+        region=getattr(args, "region", None),
+        gpu_count=getattr(args, "gpu_count", None),
+        public_ip=public_ip,
+        volume_gb=getattr(args, "volume_gb", None),
+        preemptible_ok=bool(getattr(args, "preemptible_ok", False)),
+        cached_models=tuple(getattr(args, "cached_model", []) or ()),
+        labels=tuple(sorted(labels.items())),
+        trust_tier=getattr(args, "trust_tier", None),
+        network_tier=getattr(args, "network_tier", None),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        provider_options=_parse_provider_options(getattr(args, "provider_option", []) or ()),
     )
 
 
@@ -613,6 +660,58 @@ def build_parser() -> argparse.ArgumentParser:
     session_stop_parser.add_argument("--repo-root")
     session_stop_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
 
+    provider_offers_parser = subparsers.add_parser(
+        "providers-list-offers",
+        help="List normalized provider offers from external capacity adapters.",
+    )
+    provider_offers_parser.add_argument("--provider", choices=sorted(PROVIDER_CHOICES))
+    provider_offers_parser.add_argument("--gpu-name")
+    provider_offers_parser.add_argument("--min-gpu-count", type=int)
+    provider_offers_parser.add_argument("--min-vram-gb", type=float)
+    provider_offers_parser.add_argument("--max-price-hourly", type=float)
+    provider_offers_parser.add_argument("--region")
+    provider_offers_parser.add_argument("--preemptible-ok", action="store_true")
+
+    provider_blueprints_parser = subparsers.add_parser(
+        "providers-list-blueprints",
+        help="List built-in provider provisioning blueprints.",
+    )
+    provider_blueprints_parser.add_argument("--provider", choices=sorted((*PROVIDER_CHOICES, "any")))
+    provider_blueprints_parser.add_argument("--model-id")
+
+    provider_provision_parser = subparsers.add_parser(
+        "providers-provision",
+        help="Create a provider provisioning job and emit its bootstrap contract.",
+    )
+    provider_provision_parser.add_argument("--provider", required=True, choices=sorted((*PROVIDER_CHOICES, "any")))
+    provider_provision_parser.add_argument("--blueprint")
+    provider_provision_parser.add_argument("--offer-id")
+    provider_provision_parser.add_argument("--region")
+    provider_provision_parser.add_argument("--gpu-count", type=int)
+    provider_provision_parser.add_argument("--public-ip", action="store_true")
+    provider_provision_parser.add_argument("--volume-gb", type=int)
+    provider_provision_parser.add_argument("--preemptible-ok", action="store_true")
+    provider_provision_parser.add_argument("--cached-model", action="append", default=[])
+    provider_provision_parser.add_argument("--label", action="append", default=[])
+    provider_provision_parser.add_argument("--trust-tier")
+    provider_provision_parser.add_argument("--network-tier")
+    provider_provision_parser.add_argument("--provider-option", action="append", default=[])
+    provider_provision_parser.add_argument("--dry-run", action="store_true")
+    provider_provision_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
+    provider_provision_parser.add_argument("--registry-url")
+    provider_provision_parser.add_argument("--heartbeat-url")
+    provider_provision_parser.add_argument("--heartbeat-state-file")
+    provider_provision_parser.add_argument("--repo-clone-url")
+    provider_provision_parser.add_argument("--repo-branch")
+
+    provider_jobs_parser = subparsers.add_parser(
+        "providers-jobs",
+        help="Inspect provider provisioning jobs from the JSON job store.",
+    )
+    provider_jobs_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
+    provider_jobs_parser.add_argument("--job-id")
+    provider_jobs_parser.add_argument("--status")
+
     save_parser = subparsers.add_parser("save-registry", help="Save registry state to disk.")
     save_parser.add_argument("--local-file")
     save_parser.add_argument("--remote-file")
@@ -964,6 +1063,76 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
         print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "providers-list-offers":
+        service = ProviderService()
+        try:
+            offers = service.list_offers(
+                provider=args.provider,
+                gpu_name=args.gpu_name,
+                min_gpu_count=args.min_gpu_count,
+                min_vram_gb=args.min_vram_gb,
+                max_price_hourly=args.max_price_hourly,
+                region=args.region,
+                preemptible_ok=True if args.preemptible_ok else None,
+            )
+        except ProviderError as exc:
+            print(json.dumps({"status": "failed", "reason": str(exc)}, indent=2, sort_keys=True))
+            return 1
+        print(json.dumps({"offers": [offer.to_dict() for offer in offers]}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "providers-list-blueprints":
+        service = ProviderService()
+        blueprints = service.list_blueprints(provider=args.provider, model_id=args.model_id)
+        print(
+            json.dumps(
+                {"blueprints": [blueprint.to_dict() for blueprint in blueprints]},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+
+    if args.command == "providers-provision":
+        service = ProviderService(
+            jobs_file=args.jobs_file,
+            registry_url=args.registry_url,
+            heartbeat_url=args.heartbeat_url,
+            heartbeat_state_file=args.heartbeat_state_file,
+            repo_clone_url=(
+                args.repo_clone_url
+                or "https://github.com/JohnnyDillinger-hub/Claude-Code-Game-Studios.git"
+            ),
+            repo_branch=args.repo_branch or "codex/mesh-runtime-tp4",
+        )
+        try:
+            provision_request = _build_provision_request(args)
+            job = service.provision(provision_request)
+        except (ProviderError, ValueError) as exc:
+            print(json.dumps({"status": "failed", "reason": str(exc)}, indent=2, sort_keys=True))
+            return 1
+        print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
+        return 0 if job.status != "failed" else 1
+
+    if args.command == "providers-jobs":
+        service = ProviderService(jobs_file=args.jobs_file)
+        if args.job_id:
+            job = service.get_job(args.job_id)
+            if job is None:
+                print(
+                    json.dumps(
+                        {"status": "not_found", "job_id": args.job_id},
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 1
+            print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
+            return 0
+        jobs = service.list_jobs(status=args.status)
+        print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
         return 0
 
     if args.command == "save-registry":
