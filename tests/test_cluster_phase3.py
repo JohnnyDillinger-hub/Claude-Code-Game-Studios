@@ -479,6 +479,38 @@ class ClusterPhase3Tests(unittest.TestCase):
             ),
         )
 
+    def test_infer_packaged_cuda_home_accepts_trtllm_executable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-trtllm"
+            executable_path = venv_root / "bin" / "trtllm-serve"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+            cuda_runtime = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "include"
+            )
+            cuda_runtime.mkdir(parents=True, exist_ok=True)
+            (cuda_runtime / "cuda_runtime.h").write_text("", encoding="utf-8")
+
+            detected = infer_packaged_cuda_home(str(executable_path))
+
+        self.assertEqual(
+            detected,
+            str(
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+            ),
+        )
+
     def test_prepend_executable_dir_to_path_puts_venv_bin_first(self) -> None:
         env = {"PATH": "/usr/local/bin:/usr/bin"}
 
@@ -578,6 +610,47 @@ class ClusterPhase3Tests(unittest.TestCase):
             payload["deployment"]["launch_preferences"]["cuda_graph_max_bs"],
             32,
         )
+
+    def test_launch_agent_uses_local_file_as_local_anchor_without_local_node_id(self) -> None:
+        local_node = NodeInventory(
+            node_id="local-dummy",
+            host="127.0.0.1",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 4096, total_mib=8192),),
+        )
+        remote_node = NodeInventory(
+            node_id="remote-trt",
+            host="10.0.0.70",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 32100, total_mib=32607), make_gpu(1, 32100, total_mib=32607)),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = Path(tmpdir) / "local.json"
+            remote_path = Path(tmpdir) / "remote.json"
+            local_path.write_text(json.dumps([local_node.to_dict()]), encoding="utf-8")
+            remote_path.write_text(json.dumps([remote_node.to_dict()]), encoding="utf-8")
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "launch-agent",
+                        "--local-file",
+                        str(local_path),
+                        "--remote-file",
+                        str(remote_path),
+                        "--agent-id",
+                        "agent-trt-anchor",
+                        "--profile",
+                        "qwen-coder-30b-trtllm-tp2",
+                        "--dry-run",
+                    ]
+                )
+        payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["placement"]["node_id"], "remote-trt")
+        self.assertEqual(payload["placement"]["source"], "remote")
+        self.assertEqual(payload["launch"]["mode"], "remote-ssh")
 
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

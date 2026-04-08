@@ -99,6 +99,11 @@ def _resolve_local_node_for_registry(args: argparse.Namespace, registry: NodeReg
         if record is None:
             raise ValueError(f"Local node id {local_node_id!r} is not present in the registry")
         return record.node
+    if not getattr(args, "state_file", None):
+        local_path = _resolve_inventory_path(getattr(args, "local_file", None), LOCAL_NODE_PATH)
+        local_nodes = load_node_inventory_file(local_path)
+        if local_nodes:
+            return local_nodes[0]
     nodes = registry.list_nodes()
     if not nodes:
         raise ValueError("Registry is empty; cannot determine a local node")

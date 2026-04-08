@@ -392,6 +392,47 @@ def wait_for_json_endpoint(
     )
 
 
+def wait_for_json_endpoint_or_process_exit(
+    urls: Iterable[str],
+    *,
+    startup_timeout_seconds: int,
+    request_timeout_seconds: int,
+    process_pid: int,
+    process_name: str,
+    stderr_log: Path | None = None,
+) -> tuple[str, dict[str, Any]]:
+    deadline = time.monotonic() + startup_timeout_seconds
+    last_error: str | None = None
+    url_list = list(urls)
+    while time.monotonic() < deadline:
+        try:
+            waited_pid, wait_status = os.waitpid(process_pid, os.WNOHANG)
+        except ChildProcessError:
+            waited_pid = 0
+            wait_status = 0
+        if waited_pid == process_pid:
+            if os.WIFEXITED(wait_status):
+                process_status = f"exit code {os.WEXITSTATUS(wait_status)}"
+            elif os.WIFSIGNALED(wait_status):
+                process_status = f"signal {os.WTERMSIG(wait_status)}"
+            else:
+                process_status = "unknown exit status"
+            log_hint = f"; see {stderr_log}" if stderr_log is not None else ""
+            raise WorkerError(
+                f"{process_name} exited before becoming ready ({process_status}){log_hint}"
+            )
+        for url in url_list:
+            try:
+                return url, read_json_url(url, timeout_seconds=request_timeout_seconds)
+            except (error.URLError, TimeoutError, json.JSONDecodeError, WorkerError) as exc:
+                last_error = str(exc)
+        time.sleep(0.5)
+    raise WorkerError(
+        "Timed out waiting for backend endpoint to become ready"
+        + (f": {last_error}" if last_error else "")
+    )
+
+
 def start_background_process(
     command: list[str],
     *,
@@ -1193,6 +1234,9 @@ class TrtllmAdapter:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         prepend_executable_dir_to_path(env, trtllm_executable)
         prepend_env_path_entries(env, "LD_LIBRARY_PATH", infer_packaged_library_dirs(trtllm_executable))
+        packaged_cuda_home = infer_packaged_cuda_home(trtllm_executable)
+        if packaged_cuda_home is not None:
+            env["CUDA_HOME"] = packaged_cuda_home
         write_session_payload(
             session_path,
             WorkerSession(
@@ -1224,10 +1268,13 @@ class TrtllmAdapter:
             stdout_log=stdout_log,
             stderr_log=stderr_log,
         )
-        ready_url, _ = wait_for_json_endpoint(
+        ready_url, _ = wait_for_json_endpoint_or_process_exit(
             health_candidates,
             startup_timeout_seconds=args.startup_timeout_seconds,
             request_timeout_seconds=min(args.request_timeout_seconds, 10),
+            process_pid=server_pid,
+            process_name="TensorRT-LLM server",
+            stderr_log=stderr_log,
         )
         session = WorkerSession(
             status="launched",
@@ -1388,5 +1435,6 @@ __all__ = [
     "start_background_process",
     "utc_timestamp",
     "wait_for_json_endpoint",
+    "wait_for_json_endpoint_or_process_exit",
     "write_session_payload",
 ]

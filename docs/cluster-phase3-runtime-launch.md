@@ -82,7 +82,10 @@ supported for profiles such as `qwen-coder-30b-trtllm-tp2` and
 `qwen-coder-30b-trtllm-tp4`. The runtime adapter also prepends packaged CUDA,
 TensorRT, and Torch library directories from the target virtualenv into
 `LD_LIBRARY_PATH` so `trtllm-serve` can resolve shared objects such as
-`libcublasLt.so.13` and `libnvinfer.so.10` on freshly provisioned nodes.
+`libcublasLt.so.13` and `libnvinfer.so.10` on freshly provisioned nodes. When a
+packaged CUDA runtime is present inside the virtualenv, the adapter also sets
+`CUDA_HOME` from that layout so `deep_gemm`-based startup paths do not fail on
+nodes without a system CUDA toolkit.
 
 ### Python / Hugging Face
 
