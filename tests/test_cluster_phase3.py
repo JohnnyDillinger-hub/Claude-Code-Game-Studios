@@ -87,6 +87,9 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertTrue(profiles["qwen-coder-30b-sglang-tp4"].runtime_options["trust_remote_code"])
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_adapter, "trtllm-server")
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["tensor_parallel_size"], 2)
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["max_batch_size"], 4)
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["max_num_tokens"], 4096)
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["max_seq_len"], 8192)
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp4"].runtime_options["pipeline_parallel_size"], 1)
 
     def test_build_worker_command_includes_real_ollama_launch_args(self) -> None:
@@ -284,8 +287,12 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("2", command)
         self.assertIn("--pipeline-parallel-size", command)
         self.assertIn("1", command)
+        self.assertIn("--trtllm-max-batch-size", command)
+        self.assertIn("4", command)
+        self.assertIn("--trtllm-max-num-tokens", command)
+        self.assertIn("4096", command)
         self.assertIn("--trtllm-max-seq-len", command)
-        self.assertIn("16384", command)
+        self.assertIn("8192", command)
 
     def test_build_worker_command_includes_trtllm_launch_args_for_tp4_profile(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b-trtllm-tp4")

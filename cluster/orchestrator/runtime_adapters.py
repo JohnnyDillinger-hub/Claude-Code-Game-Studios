@@ -1234,6 +1234,7 @@ class TrtllmAdapter:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         prepend_executable_dir_to_path(env, trtllm_executable)
         prepend_env_path_entries(env, "LD_LIBRARY_PATH", infer_packaged_library_dirs(trtllm_executable))
+        env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         packaged_cuda_home = infer_packaged_cuda_home(trtllm_executable)
         if packaged_cuda_home is not None:
             env["CUDA_HOME"] = packaged_cuda_home
