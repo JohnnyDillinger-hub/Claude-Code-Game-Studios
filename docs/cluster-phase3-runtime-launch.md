@@ -79,7 +79,10 @@ The current first-class profiles use the `TensorRT-LLM` OpenAI-compatible
 server in `pytorch` backend mode so they can launch directly from a model path
 without requiring a prebuilt engine. Single-node multi-GPU reservations are now
 supported for profiles such as `qwen-coder-30b-trtllm-tp2` and
-`qwen-coder-30b-trtllm-tp4`.
+`qwen-coder-30b-trtllm-tp4`. The runtime adapter also prepends packaged CUDA,
+TensorRT, and Torch library directories from the target virtualenv into
+`LD_LIBRARY_PATH` so `trtllm-serve` can resolve shared objects such as
+`libcublasLt.so.13` and `libnvinfer.so.10` on freshly provisioned nodes.
 
 ### Python / Hugging Face
 

@@ -302,6 +302,49 @@ def prepend_executable_dir_to_path(env: dict[str, str], executable_path: str) ->
     env["PATH"] = os.pathsep.join(path_entries)
 
 
+def prepend_env_path_entries(env: dict[str, str], variable_name: str, entries: Iterable[str]) -> None:
+    current_value = env.get(variable_name, "")
+    current_entries = [entry for entry in current_value.split(os.pathsep) if entry] if current_value else []
+    desired_entries = [entry for entry in entries if entry]
+    for entry in reversed(desired_entries):
+        if entry in current_entries:
+            current_entries = [existing for existing in current_entries if existing != entry]
+        current_entries.insert(0, entry)
+    env[variable_name] = os.pathsep.join(current_entries)
+
+
+def infer_packaged_library_dirs(executable_path: str) -> tuple[str, ...]:
+    executable = Path(expand_path_text(executable_path))
+    venv_root = executable.parent.parent
+    candidate_paths: list[Path] = []
+    for site_packages_root in sorted(venv_root.glob("lib/python*/site-packages")):
+        tensorrt_libs = site_packages_root / "tensorrt_libs"
+        if tensorrt_libs.is_dir():
+            candidate_paths.append(tensorrt_libs)
+
+        torch_lib = site_packages_root / "torch" / "lib"
+        if torch_lib.is_dir():
+            candidate_paths.append(torch_lib)
+
+        nvidia_root = site_packages_root / "nvidia"
+        if nvidia_root.is_dir():
+            children = sorted(
+                (child for child in nvidia_root.iterdir() if child.is_dir()),
+                key=lambda child: (0 if child.name == "cu13" else 1 if child.name == "cu12" else 2, child.name),
+            )
+            for child in children:
+                lib_dir = child / "lib"
+                if lib_dir.is_dir():
+                    candidate_paths.append(lib_dir)
+
+    ordered_paths: list[str] = []
+    for candidate in candidate_paths:
+        candidate_text = str(candidate)
+        if candidate_text not in ordered_paths:
+            ordered_paths.append(candidate_text)
+    return tuple(ordered_paths)
+
+
 def read_json_url(url: str, *, timeout_seconds: int) -> dict[str, Any]:
     with request.urlopen(url, timeout=timeout_seconds) as response:
         raw = response.read().decode("utf-8")
@@ -1149,6 +1192,7 @@ class TrtllmAdapter:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         prepend_executable_dir_to_path(env, trtllm_executable)
+        prepend_env_path_entries(env, "LD_LIBRARY_PATH", infer_packaged_library_dirs(trtllm_executable))
         write_session_payload(
             session_path,
             WorkerSession(
@@ -1328,10 +1372,12 @@ __all__ = [
     "find_conflicting_session",
     "get_runtime_adapter",
     "infer_packaged_cuda_home",
+    "infer_packaged_library_dirs",
     "launch_with_adapter",
     "load_session_payload",
     "post_json",
     "prepend_executable_dir_to_path",
+    "prepend_env_path_entries",
     "read_json_url",
     "resolve_gpu_indices",
     "resolve_launch_mode",

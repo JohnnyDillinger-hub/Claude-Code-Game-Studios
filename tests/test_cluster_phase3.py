@@ -30,7 +30,8 @@ from cluster.orchestrator.remote_worker import (
     find_conflicting_session,
 )
 from cluster.orchestrator.runtime_adapters import infer_packaged_cuda_home
-from cluster.orchestrator.runtime_adapters import prepend_executable_dir_to_path
+from cluster.orchestrator.runtime_adapters import infer_packaged_library_dirs
+from cluster.orchestrator.runtime_adapters import prepend_env_path_entries, prepend_executable_dir_to_path
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.scheduler import schedule_agent
 from cluster.orchestrator.state_store import RegistryStateStore
@@ -489,6 +490,39 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(
             env["PATH"].split(":")[0],
             "/tmp/.venv-sglang/bin",
+        )
+
+    def test_infer_packaged_library_dirs_discovers_trtllm_runtime_libs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-trtllm"
+            executable_path = venv_root / "bin" / "trtllm-serve"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+
+            site_packages = venv_root / "lib" / "python3.10" / "site-packages"
+            (site_packages / "nvidia" / "cu13" / "lib").mkdir(parents=True, exist_ok=True)
+            (site_packages / "nvidia" / "cuda_runtime" / "lib").mkdir(parents=True, exist_ok=True)
+            (site_packages / "torch" / "lib").mkdir(parents=True, exist_ok=True)
+            (site_packages / "tensorrt_libs").mkdir(parents=True, exist_ok=True)
+
+            detected = infer_packaged_library_dirs(str(executable_path))
+
+        self.assertIn(str(site_packages / "nvidia" / "cu13" / "lib"), detected)
+        self.assertIn(str(site_packages / "torch" / "lib"), detected)
+        self.assertIn(str(site_packages / "tensorrt_libs"), detected)
+
+    def test_prepend_env_path_entries_puts_runtime_libs_first(self) -> None:
+        env = {"LD_LIBRARY_PATH": "/usr/local/lib:/usr/lib"}
+
+        prepend_env_path_entries(
+            env,
+            "LD_LIBRARY_PATH",
+            ["/tmp/.venv-trtllm/lib-a", "/tmp/.venv-trtllm/lib-b", "/usr/lib"],
+        )
+
+        self.assertEqual(
+            env["LD_LIBRARY_PATH"].split(":")[0:3],
+            ["/tmp/.venv-trtllm/lib-a", "/tmp/.venv-trtllm/lib-b", "/usr/lib"],
         )
 
     def test_launch_agent_dry_run_emits_deployment_spec(self) -> None:
