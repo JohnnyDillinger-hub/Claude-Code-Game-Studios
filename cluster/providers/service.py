@@ -290,7 +290,12 @@ class ProviderService:
             for offer in offers:
                 if offer.offer_id == request.offer_id:
                     return offer
-            raise ProviderError(f"Offer id {request.offer_id!r} was not found for provider {request.provider!r}")
+            return ProviderOffer(
+                provider=request.provider,
+                offer_id=request.offer_id,
+                resource_kind="instance",
+                region=request.region,
+            )
         if blueprint is None:
             return None
         if not offers:

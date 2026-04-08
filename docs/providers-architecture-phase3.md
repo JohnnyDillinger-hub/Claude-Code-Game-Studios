@@ -62,6 +62,7 @@ Each provider adapter is responsible for:
 - listing offers
 - validating provider-specific requests
 - creating a resource or a dry-run stub
+- normalizing provider-specific connection details into `ProvisionedResource`
 
 The provider layer does not:
 
@@ -73,7 +74,7 @@ That separation keeps the existing cluster orchestration stable while we add pro
 
 ## Recommended Next Steps
 
-1. Add real create flows for `vast` first.
-2. Add bootstrap execution and heartbeat confirmation.
+1. Add bootstrap execution and heartbeat confirmation after real `Vast` create.
+2. Port the same real create pattern to `runpod`.
 3. Expose the same provider service through a thin HTTP API for the GUI.
 4. Add policy controls only after provisioning and joining are reliable.

@@ -16,8 +16,13 @@ The current implementation adds a provider service under [cluster/providers](/Us
 - built-in blueprints
 - JSON-backed provisioning jobs
 - CLI discovery and provisioning scaffolding
-- dry-run provider resource creation stubs
+- real `Vast` create-path when `VAST_API_KEY` is configured
+- dry-run provider resource creation stubs for the remaining providers
 - bootstrap bundle generation for future auto-join
+
+For `Vast`, a non-dry-run `providers-provision` request now uses the real
+provider create endpoint when `VAST_API_KEY` is present. Without that key, the
+command must stay in `--dry-run`.
 
 Supported provider adapters:
 
@@ -45,7 +50,8 @@ Provisioning:
 - Creates a `ProvisionJob`.
 - Selects an offer or blueprint.
 - Generates a `BootstrapBundle`.
-- May return a dry-run `ProvisionedResource`.
+- Returns a dry-run `ProvisionedResource` when no real provider call is made.
+- Can create a real Vast instance and normalize its SSH details into `ProvisionedResource`.
 
 Joining:
 
@@ -62,7 +68,7 @@ This phase intentionally does not implement:
 - provider-side billing controls
 - full secret management UX
 - automatic NAT traversal
-- full provider create flows in production mode
+- full provider create flows in production mode for `runpod` and `nebius`
 - cluster join confirmation from provider jobs
 
 ## Managed Vs Bring Your Own Provider

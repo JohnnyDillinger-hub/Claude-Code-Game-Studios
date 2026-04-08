@@ -6,12 +6,14 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cluster.orchestrator.clusterctl import main as clusterctl_main
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.providers.blueprints import load_builtin_blueprints
 from cluster.providers.job_store import ProvisionJobStore
 from cluster.providers.models import ProviderOffer, ProvisionRequest
+from cluster.providers.vast_adapter import VastAdapter
 from cluster.providers.service import ProviderService
 
 
@@ -188,3 +190,81 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(read_exit_code, 0)
         self.assertEqual(created["job_id"], loaded["job_id"])
         self.assertEqual(loaded["status"], "bootstrapping")
+
+    def test_provider_service_preserves_explicit_offer_id_when_not_in_listing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = ProviderService(jobs_file=Path(tmpdir) / "jobs.json")
+
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="custom-gpu-node",
+                    offer_id="offer-manual-123",
+                    dry_run=True,
+                )
+            )
+
+        assert job.selected_offer is not None
+        self.assertEqual(job.selected_offer.offer_id, "offer-manual-123")
+        self.assertEqual(job.provisioned_resource.offer_id, "offer-manual-123")
+
+    def test_vast_adapter_real_create_normalizes_created_instance(self) -> None:
+        adapter = VastAdapter(api_key="test-token")
+        service = ProviderService(adapters=(adapter,))
+        blueprint = {
+            item.blueprint_id: item for item in load_builtin_blueprints()
+        }["qwen-coder-node-vast"]
+        request = ProvisionRequest(
+            provider="vast",
+            blueprint_id="qwen-coder-node-vast",
+            offer_id="12345678",
+            dry_run=False,
+        )
+        effective_request = service._apply_blueprint_defaults(request, blueprint)
+        bundle = service.build_bootstrap_bundle(effective_request, blueprint=blueprint)
+        selected_offer = ProviderOffer(
+            provider="vast",
+            offer_id="12345678",
+            resource_kind="instance",
+            region="EU",
+            gpu_name="NVIDIA GeForce RTX 5090",
+            gpu_count=2,
+            preemptible=False,
+        )
+
+        with patch.object(
+            adapter,
+            "_put_json",
+            return_value={"success": True, "new_contract": 99123},
+        ) as put_json, patch.object(
+            adapter,
+            "_get_json",
+            return_value={
+                "instances": {
+                    "id": 99123,
+                    "actual_status": "running",
+                    "label": bundle.node_id,
+                    "ssh_host": "203.0.113.10",
+                    "ssh_port": 40222,
+                    "public_ipaddr": "203.0.113.10",
+                }
+            },
+        ) as get_json:
+            resource = adapter.create_resource(
+                effective_request,
+                bundle,
+                blueprint=blueprint,
+                selected_offer=selected_offer,
+            )
+
+        self.assertEqual(resource.resource_id, "99123")
+        self.assertEqual(resource.status, "running")
+        self.assertEqual(resource.host, "203.0.113.10")
+        self.assertEqual(resource.ssh_port, 40222)
+        self.assertEqual(resource.ssh_user, "root")
+        self.assertEqual(resource.offer_id, "12345678")
+        put_payload = put_json.call_args.args[1]
+        self.assertEqual(put_json.call_args.args[0], "https://console.vast.ai/api/v0/asks/12345678/")
+        self.assertEqual(put_payload["runtype"], "ssh_direct")
+        self.assertIn("cluster.node_agent.daemon", put_payload["onstart"])
+        self.assertEqual(get_json.call_args.args[0], "https://console.vast.ai/api/v0/instances/99123/")
