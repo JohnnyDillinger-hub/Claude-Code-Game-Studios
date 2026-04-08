@@ -24,6 +24,7 @@ from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtim
 from cluster.orchestrator.remote_sessions import collect_session_claims
 from cluster.orchestrator.remote_worker import (
     build_sglang_server_command,
+    build_trtllm_serve_command,
     build_vllm_server_command,
     choose_runtime_port,
     find_conflicting_session,
@@ -69,6 +70,8 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("qwen-coder-30b-vllm-tp4", profiles)
         self.assertIn("qwen-coder-30b-sglang-tp2", profiles)
         self.assertIn("qwen-coder-30b-sglang-tp4", profiles)
+        self.assertIn("qwen-coder-30b-trtllm-tp2", profiles)
+        self.assertIn("qwen-coder-30b-trtllm-tp4", profiles)
         self.assertEqual(profiles["gemma3-4b"].preferred_backend, "ollama")
         self.assertEqual(profiles["gemma3-4b"].runtime_adapter, "ollama-server")
         self.assertEqual(profiles["qwen-coder-30b-vllm"].preferred_backend, "vllm")
@@ -80,6 +83,9 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(profiles["qwen-coder-30b-sglang-tp2"].runtime_adapter, "sglang-server")
         self.assertEqual(profiles["qwen-coder-30b-sglang-tp2"].runtime_options["tensor_parallel_size"], 2)
         self.assertTrue(profiles["qwen-coder-30b-sglang-tp4"].runtime_options["trust_remote_code"])
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_adapter, "trtllm-server")
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["tensor_parallel_size"], 2)
+        self.assertEqual(profiles["qwen-coder-30b-trtllm-tp4"].runtime_options["pipeline_parallel_size"], 1)
 
     def test_build_worker_command_includes_real_ollama_launch_args(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -237,6 +243,79 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--disable-custom-all-reduce", command)
         self.assertIn("--disable-cuda-graph", command)
 
+    def test_build_worker_command_includes_trtllm_launch_args_for_tp2_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-trtllm-tp2")
+        request = AgentRequest(
+            agent_id="agent-trtllm-tp2",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-trt2",
+            host="10.0.0.63",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32050,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--launch-mode", command)
+        self.assertIn("trtllm-server", command)
+        self.assertIn("--trtllm-executable", command)
+        self.assertTrue(
+            any(item.endswith(".venv-trtllm/bin/trtllm-serve") for item in command),
+            msg=str(command),
+        )
+        self.assertIn("--trtllm-backend", command)
+        self.assertIn("pytorch", command)
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("2", command)
+        self.assertIn("--pipeline-parallel-size", command)
+        self.assertIn("1", command)
+        self.assertIn("--trtllm-max-seq-len", command)
+        self.assertIn("16384", command)
+
+    def test_build_worker_command_includes_trtllm_launch_args_for_tp4_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-trtllm-tp4")
+        request = AgentRequest(
+            agent_id="agent-trtllm-tp4",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-trt4",
+            host="10.0.0.64",
+            gpu_index=0,
+            gpu_indices=(0, 1, 2, 3),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=24000,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1,2,3", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("4", command)
+        self.assertIn("--trtllm-max-num-tokens", command)
+        self.assertIn("16384", command)
+
     def test_build_worker_command_respects_sglang_cuda_graph_overrides(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b-sglang-tp2").with_launch_overrides(
             {
@@ -342,6 +421,30 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--disable-cuda-graph", command)
         self.assertIn("--cuda-graph-max-bs", command)
         self.assertIn("24", command)
+
+    def test_trtllm_serve_command_and_port_are_multi_gpu_deterministic(self) -> None:
+        command = build_trtllm_serve_command(
+            executable="trtllm-serve",
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            host="127.0.0.1",
+            port=choose_runtime_port(20000, 4),
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            backend="pytorch",
+            max_batch_size=16,
+            max_num_tokens=16384,
+            max_seq_len=32768,
+            log_level="info",
+        )
+
+        self.assertEqual(choose_runtime_port(20000, 4), 20004)
+        self.assertEqual(command[0:3], ["trtllm-serve", "serve", "Qwen/Qwen3-Coder-30B-A3B-Instruct"])
+        self.assertIn("--backend", command)
+        self.assertIn("pytorch", command)
+        self.assertIn("--tp_size", command)
+        self.assertIn("4", command)
+        self.assertIn("--max_seq_len", command)
+        self.assertIn("32768", command)
 
     def test_infer_packaged_cuda_home_prefers_packaged_runtime_layout(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

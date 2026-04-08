@@ -153,6 +153,21 @@ def build_worker_command(
     )
     _append_optional_arg(
         command,
+        "--trtllm-executable",
+        launch_metadata.get("trtllm_executable"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-backend",
+        launch_metadata.get("trtllm_backend"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-tokenizer",
+        launch_metadata.get("trtllm_tokenizer"),
+    )
+    _append_optional_arg(
+        command,
         "--gpu-memory-utilization",
         launch_metadata.get("gpu_memory_utilization"),
     )
@@ -190,6 +205,31 @@ def build_worker_command(
         command,
         "--tensor-parallel-size",
         launch_metadata.get("tensor_parallel_size"),
+    )
+    _append_optional_arg(
+        command,
+        "--pipeline-parallel-size",
+        launch_metadata.get("pipeline_parallel_size"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-max-batch-size",
+        launch_metadata.get("max_batch_size"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-max-num-tokens",
+        launch_metadata.get("max_num_tokens"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-max-seq-len",
+        launch_metadata.get("max_seq_len"),
+    )
+    _append_optional_arg(
+        command,
+        "--trtllm-log-level",
+        launch_metadata.get("log_level"),
     )
     return command
 

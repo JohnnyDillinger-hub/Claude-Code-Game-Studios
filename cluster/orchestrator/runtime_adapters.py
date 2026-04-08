@@ -25,6 +25,9 @@ DEFAULT_VLLM_PORT_BASE = 18000
 DEFAULT_VLLM_LAUNCH_MODULE = "vllm.entrypoints.openai.api_server"
 DEFAULT_SGLANG_PORT_BASE = 19000
 DEFAULT_SGLANG_LAUNCH_MODULE = "sglang.launch_server"
+DEFAULT_TRTLLM_PORT_BASE = 20000
+DEFAULT_TRTLLM_EXECUTABLE = "trtllm-serve"
+DEFAULT_TRTLLM_BACKEND = "pytorch"
 DEFAULT_MEM_FRACTION_STATIC = 0.9
 SESSION_OK_STATUSES = {"starting", "launched", "reused"}
 
@@ -220,6 +223,49 @@ def build_sglang_server_command(
         command.append("--disable-cuda-graph")
     if cuda_graph_max_bs is not None:
         command.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
+    return command
+
+
+def build_trtllm_serve_command(
+    *,
+    executable: str,
+    model: str,
+    host: str,
+    port: int,
+    tensor_parallel_size: int,
+    pipeline_parallel_size: int = 1,
+    backend: str = DEFAULT_TRTLLM_BACKEND,
+    tokenizer: str | None = None,
+    max_batch_size: int | None = None,
+    max_num_tokens: int | None = None,
+    max_seq_len: int | None = None,
+    log_level: str | None = None,
+) -> list[str]:
+    command = [
+        executable,
+        "serve",
+        model,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--backend",
+        backend,
+        "--tp_size",
+        str(tensor_parallel_size),
+    ]
+    if pipeline_parallel_size != 1:
+        command.extend(["--pp_size", str(pipeline_parallel_size)])
+    if tokenizer is not None:
+        command.extend(["--tokenizer", tokenizer])
+    if max_batch_size is not None:
+        command.extend(["--max_batch_size", str(max_batch_size)])
+    if max_num_tokens is not None:
+        command.extend(["--max_num_tokens", str(max_num_tokens)])
+    if max_seq_len is not None:
+        command.extend(["--max_seq_len", str(max_seq_len)])
+    if log_level is not None:
+        command.extend(["--log_level", str(log_level)])
     return command
 
 
@@ -421,6 +467,8 @@ def resolve_launch_mode(args: argparse.Namespace) -> str:
         return "vllm-server"
     if backend == "sglang":
         return "sglang-server"
+    if backend in {"tensorrt-llm", "trtllm"}:
+        return "trtllm-server"
     if backend == "python-hf":
         return "python-hf-probe"
     raise WorkerError(f"Unsupported backend {backend!r}")
@@ -976,6 +1024,193 @@ class SglangAdapter:
         return session
 
 
+class TrtllmAdapter:
+    name = "trtllm-server"
+
+    def launch(self, args: argparse.Namespace, session_dir: Path) -> WorkerSession:
+        gpu_indices = resolve_gpu_indices(args)
+        expected_gpu_count = int(args.tensor_parallel_size) * int(args.pipeline_parallel_size)
+        if expected_gpu_count <= 0:
+            raise WorkerError("TensorRT-LLM requires positive tp/pp sizes")
+        if len(gpu_indices) != expected_gpu_count:
+            raise WorkerError(
+                f"TensorRT-LLM requires tp*pp={expected_gpu_count} GPUs, "
+                f"but gpu_indices={gpu_indices}"
+            )
+        trtllm_executable = expand_path_text(args.trtllm_executable)
+        if "/" in args.trtllm_executable and not Path(trtllm_executable).exists():
+            raise WorkerError(
+                f"TensorRT-LLM executable {trtllm_executable!r} is not present on the target node"
+            )
+        if "/" not in args.trtllm_executable:
+            resolved_executable = shutil.which(trtllm_executable)
+            if resolved_executable is None:
+                raise WorkerError(
+                    f"TensorRT-LLM executable {trtllm_executable!r} is not installed on the target node"
+                )
+            trtllm_executable = resolved_executable
+        if args.trtllm_backend == "trt" and not args.trtllm_tokenizer:
+            raise WorkerError(
+                "TensorRT-LLM backend=trt requires --trtllm-tokenizer when serving an engine path"
+            )
+
+        port_base = args.port_base or DEFAULT_TRTLLM_PORT_BASE
+        port = choose_runtime_port_for_group(port_base, gpu_indices)
+        conflict = find_conflicting_session(
+            session_dir,
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            listen_port=port,
+        )
+        if conflict is not None:
+            raise WorkerError(
+                f"GPU group {list(gpu_indices)} on {args.node_id} already has an active session for "
+                f"agent {conflict.get('agent_id')!r}"
+            )
+
+        session_path, stdout_log, stderr_log = resolve_session_paths(session_dir, args.agent_id)
+        endpoint_url = f"http://{args.server_host}:{port}"
+        health_candidates = [f"{endpoint_url}/health", f"{endpoint_url}/v1/models"]
+        existing = load_session_payload(session_path)
+        command = build_trtllm_serve_command(
+            executable=trtllm_executable,
+            model=args.model,
+            host=args.server_host,
+            port=port,
+            tensor_parallel_size=args.tensor_parallel_size,
+            pipeline_parallel_size=args.pipeline_parallel_size,
+            backend=args.trtllm_backend,
+            tokenizer=args.trtllm_tokenizer,
+            max_batch_size=args.trtllm_max_batch_size,
+            max_num_tokens=args.trtllm_max_num_tokens,
+            max_seq_len=args.trtllm_max_seq_len,
+            log_level=args.trtllm_log_level,
+        )
+        if (
+            existing is not None
+            and existing.get("listen_port") == port
+            and existing.get("endpoint_url") == endpoint_url
+            and session_payload_gpu_indices(existing) == gpu_indices
+            and existing.get("command") == command
+            and str(existing.get("status")) in SESSION_OK_STATUSES
+        ):
+            try:
+                ready_url, _ = wait_for_json_endpoint(
+                    health_candidates,
+                    startup_timeout_seconds=3,
+                    request_timeout_seconds=2,
+                )
+                session = WorkerSession(
+                    status="reused",
+                    agent_id=args.agent_id,
+                    node_id=args.node_id,
+                    backend=args.backend,
+                    runtime_class=args.runtime_class,
+                    model=args.model,
+                    gpu_index=args.gpu_index,
+                    gpu_indices=gpu_indices,
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    single_gpu_only=len(gpu_indices) == 1,
+                    launched_at=utc_timestamp(),
+                    session_file=str(session_path),
+                    endpoint_url=endpoint_url,
+                    listen_port=port,
+                    server_pid=(
+                        int(existing["server_pid"]) if existing.get("server_pid") is not None else None
+                    ),
+                    stdout_log=str(stdout_log),
+                    stderr_log=str(stderr_log),
+                    command=command,
+                    health_url=ready_url,
+                    reused=True,
+                    notes="Reused an existing dedicated TensorRT-LLM runtime for this agent.",
+                )
+                write_session_payload(session_path, session.to_dict())
+                return session
+            except (WorkerError, error.URLError, json.JSONDecodeError):
+                pass
+        try:
+            wait_for_json_endpoint(
+                health_candidates,
+                startup_timeout_seconds=1,
+                request_timeout_seconds=1,
+            )
+            raise WorkerError(
+                f"TensorRT-LLM endpoint {endpoint_url} is already live without a reusable session record"
+            )
+        except WorkerError as exc:
+            if "already live" in str(exc):
+                raise
+        except (error.URLError, json.JSONDecodeError):
+            pass
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
+        prepend_executable_dir_to_path(env, trtllm_executable)
+        write_session_payload(
+            session_path,
+            WorkerSession(
+                status="starting",
+                agent_id=args.agent_id,
+                node_id=args.node_id,
+                backend=args.backend,
+                runtime_class=args.runtime_class,
+                model=args.model,
+                gpu_index=args.gpu_index,
+                gpu_indices=gpu_indices,
+                tensor_parallel_size=args.tensor_parallel_size,
+                single_gpu_only=len(gpu_indices) == 1,
+                launched_at=utc_timestamp(),
+                session_file=str(session_path),
+                endpoint_url=endpoint_url,
+                listen_port=port,
+                stdout_log=str(stdout_log),
+                stderr_log=str(stderr_log),
+                command=command,
+                health_url=health_candidates[0],
+                notes="Dedicated TensorRT-LLM runtime is starting.",
+            ).to_dict(),
+        )
+
+        server_pid = start_background_process(
+            command,
+            env=env,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+        )
+        ready_url, _ = wait_for_json_endpoint(
+            health_candidates,
+            startup_timeout_seconds=args.startup_timeout_seconds,
+            request_timeout_seconds=min(args.request_timeout_seconds, 10),
+        )
+        session = WorkerSession(
+            status="launched",
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            backend=args.backend,
+            runtime_class=args.runtime_class,
+            model=args.model,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            tensor_parallel_size=args.tensor_parallel_size,
+            single_gpu_only=len(gpu_indices) == 1,
+            launched_at=utc_timestamp(),
+            session_file=str(session_path),
+            endpoint_url=endpoint_url,
+            listen_port=port,
+            server_pid=server_pid,
+            stdout_log=str(stdout_log),
+            stderr_log=str(stderr_log),
+            command=command,
+            health_url=ready_url,
+            notes="Dedicated TensorRT-LLM server launched and passed a health probe.",
+        )
+        write_session_payload(session_path, session.to_dict())
+        return session
+
+
 class PythonHfProbeAdapter:
     name = "python-hf-probe"
 
@@ -1045,6 +1280,7 @@ _RUNTIME_ADAPTERS: dict[str, RuntimeAdapter] = {
         OllamaAdapter(),
         VllmAdapter(),
         SglangAdapter(),
+        TrtllmAdapter(),
         PythonHfProbeAdapter(),
     )
 }
@@ -1071,6 +1307,9 @@ __all__ = [
     "DEFAULT_STARTUP_TIMEOUT_SECONDS",
     "DEFAULT_SGLANG_LAUNCH_MODULE",
     "DEFAULT_SGLANG_PORT_BASE",
+    "DEFAULT_TRTLLM_BACKEND",
+    "DEFAULT_TRTLLM_EXECUTABLE",
+    "DEFAULT_TRTLLM_PORT_BASE",
     "DEFAULT_MEM_FRACTION_STATIC",
     "DEFAULT_VLLM_LAUNCH_MODULE",
     "DEFAULT_VLLM_PORT_BASE",
@@ -1080,6 +1319,7 @@ __all__ = [
     "WorkerSession",
     "build_ollama_server_command",
     "build_sglang_server_command",
+    "build_trtllm_serve_command",
     "build_vllm_server_command",
     "choose_runtime_port",
     "choose_runtime_port_for_group",

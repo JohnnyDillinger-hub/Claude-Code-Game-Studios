@@ -66,6 +66,21 @@ particular launch.
 response. This gives the future client API a stable, serializable contract for
 the requested profile, placement constraints, and launch preferences.
 
+### TensorRT-LLM
+
+For `tensorrt-llm` profiles, the remote worker now:
+
+1. chooses a deterministic port for the selected GPU group
+2. starts `trtllm-serve serve`
+3. waits for `/health` or `/v1/models`
+4. writes the endpoint, logs, and PID into the session file
+
+The current first-class profiles use the `TensorRT-LLM` OpenAI-compatible
+server in `pytorch` backend mode so they can launch directly from a model path
+without requiring a prebuilt engine. Single-node multi-GPU reservations are now
+supported for profiles such as `qwen-coder-30b-trtllm-tp2` and
+`qwen-coder-30b-trtllm-tp4`.
+
 ### Python / Hugging Face
 
 For `python-hf` profiles, the worker runs a one-shot probe on the target GPU and

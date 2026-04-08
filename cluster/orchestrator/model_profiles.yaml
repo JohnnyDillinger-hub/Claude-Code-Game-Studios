@@ -218,6 +218,60 @@
         "disable_custom_all_reduce": true,
         "disable_cuda_graph": true
       }
+    },
+    "qwen-coder-30b-trtllm-tp2": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 30000,
+      "required_gpu_count": 2,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "tensorrt-llm",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "trtllm-server",
+        "trtllm_executable": "$HOME/Claude-Code-Game-Studios/.venv-trtllm/bin/trtllm-serve",
+        "trtllm_backend": "pytorch",
+        "server_host": "127.0.0.1",
+        "port_base": 20020,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "max_batch_size": 16,
+        "max_num_tokens": 8192,
+        "max_seq_len": 16384,
+        "log_level": "info"
+      }
+    },
+    "qwen-coder-30b-trtllm-tp4": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 20000,
+      "required_gpu_count": 4,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "tensorrt-llm",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "trtllm-server",
+        "trtllm_executable": "$HOME/Claude-Code-Game-Studios/.venv-trtllm/bin/trtllm-serve",
+        "trtllm_backend": "pytorch",
+        "server_host": "127.0.0.1",
+        "port_base": 20040,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 4,
+        "pipeline_parallel_size": 1,
+        "max_batch_size": 16,
+        "max_num_tokens": 16384,
+        "max_seq_len": 32768,
+        "log_level": "info"
+      }
     }
   }
 }

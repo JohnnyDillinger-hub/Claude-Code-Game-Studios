@@ -16,6 +16,8 @@ from cluster.orchestrator.runtime_adapters import (
     DEFAULT_SESSION_DIR,
     DEFAULT_SGLANG_LAUNCH_MODULE,
     DEFAULT_STARTUP_TIMEOUT_SECONDS,
+    DEFAULT_TRTLLM_BACKEND,
+    DEFAULT_TRTLLM_EXECUTABLE,
     DEFAULT_VLLM_LAUNCH_MODULE,
     DEFAULT_WARMUP_PROMPT,
     SESSION_OK_STATUSES,
@@ -23,6 +25,7 @@ from cluster.orchestrator.runtime_adapters import (
     WorkerSession,
     build_ollama_server_command,
     build_sglang_server_command,
+    build_trtllm_serve_command,
     build_vllm_server_command,
     choose_runtime_port,
     expand_path_text,
@@ -51,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--launch-mode",
         default="auto",
-        choices=("auto", "ollama-server", "vllm-server", "sglang-server", "python-hf-probe"),
+        choices=("auto", "ollama-server", "vllm-server", "sglang-server", "trtllm-server", "python-hf-probe"),
     )
     parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
     parser.add_argument("--server-host", default=DEFAULT_SERVER_HOST)
@@ -73,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script-path")
     parser.add_argument("--vllm-launch-module", default=DEFAULT_VLLM_LAUNCH_MODULE)
     parser.add_argument("--sglang-launch-module", default=DEFAULT_SGLANG_LAUNCH_MODULE)
+    parser.add_argument("--trtllm-executable", default=DEFAULT_TRTLLM_EXECUTABLE)
+    parser.add_argument("--trtllm-backend", default=DEFAULT_TRTLLM_BACKEND)
+    parser.add_argument("--trtllm-tokenizer")
+    parser.add_argument("--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--trtllm-max-batch-size", type=int)
+    parser.add_argument("--trtllm-max-num-tokens", type=int)
+    parser.add_argument("--trtllm-max-seq-len", type=int)
+    parser.add_argument("--trtllm-log-level")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--mem-fraction-static", type=float, default=DEFAULT_MEM_FRACTION_STATIC)
     parser.add_argument("--max-model-len", type=int)
@@ -98,6 +109,10 @@ def launch_vllm_worker(args: argparse.Namespace, session_dir: Path) -> WorkerSes
 
 def launch_sglang_worker(args: argparse.Namespace, session_dir: Path) -> WorkerSession:
     return get_runtime_adapter("sglang-server").launch(args, session_dir)
+
+
+def launch_trtllm_worker(args: argparse.Namespace, session_dir: Path) -> WorkerSession:
+    return get_runtime_adapter("trtllm-server").launch(args, session_dir)
 
 
 def launch_python_hf_probe(args: argparse.Namespace, session_dir: Path) -> WorkerSession:
