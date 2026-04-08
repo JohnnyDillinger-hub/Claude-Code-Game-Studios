@@ -5,6 +5,7 @@ from datetime import timezone
 import json
 from pathlib import Path
 import secrets
+import time
 from typing import Iterable
 
 from cluster.models import utc_now
@@ -179,6 +180,17 @@ class ProviderService:
         )
 
     def provision(self, request: ProvisionRequest) -> ProvisionJob:
+        return self.provision_with_join_wait(request)
+
+    def provision_with_join_wait(
+        self,
+        request: ProvisionRequest,
+        *,
+        wait_for_join: bool = False,
+        join_state_file: str | Path | None = None,
+        join_timeout_seconds: float = 120.0,
+        join_poll_interval_seconds: float = 5.0,
+    ) -> ProvisionJob:
         blueprint = self._resolve_blueprint(request)
         effective_request = self._apply_blueprint_defaults(request, blueprint)
         adapter = self._require_adapter(effective_request.provider)
@@ -194,7 +206,7 @@ class ProviderService:
                 blueprint=blueprint,
                 selected_offer=selected_offer,
             )
-            status = "bootstrapping" if resource.status in {"created", "dry-run"} else "provisioning"
+            status = self._initial_job_status(resource)
             job = ProvisionJob(
                 job_id=job_id,
                 status=status,
@@ -218,6 +230,15 @@ class ProviderService:
                 error_message=str(exc),
             )
         self.jobs.upsert(job)
+        if wait_for_join and job.status in {"bootstrapping", "provisioning"}:
+            if join_state_file is None:
+                raise ValueError("join_state_file is required when wait_for_join is enabled")
+            return self.wait_for_job_join(
+                job.job_id,
+                state_file=join_state_file,
+                timeout_seconds=join_timeout_seconds,
+                poll_interval_seconds=join_poll_interval_seconds,
+            )
         return job
 
     def list_jobs(self, *, status: str | None = None) -> list[ProvisionJob]:
@@ -240,6 +261,34 @@ class ProviderService:
     def reconcile_jobs_from_state_file(self, state_file: str | Path) -> list[ProvisionJob]:
         registry = RegistryStateStore(state_file).load()
         return self.reconcile_jobs(registry)
+
+    def wait_for_job_join(
+        self,
+        job_id: str,
+        *,
+        state_file: str | Path,
+        timeout_seconds: float = 120.0,
+        poll_interval_seconds: float = 5.0,
+    ) -> ProvisionJob:
+        if timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative")
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be positive")
+        deadline = time.monotonic() + timeout_seconds
+        last_job = self.get_job(job_id)
+        if last_job is None:
+            raise ProviderError(f"Unknown provisioning job id: {job_id}")
+        while True:
+            jobs = self.reconcile_jobs_from_state_file(state_file)
+            for job in jobs:
+                if job.job_id == job_id:
+                    last_job = job
+                    break
+            if last_job.status in {"joined", "failed"}:
+                return last_job
+            if time.monotonic() >= deadline:
+                return last_job
+            time.sleep(poll_interval_seconds)
 
     def _apply_blueprint_defaults(
         self,
@@ -298,6 +347,23 @@ class ProviderService:
             joined_at=joined_at,
             joined_node_snapshot=record.node.to_dict(),
         )
+
+    def _initial_job_status(self, resource) -> str:
+        normalized = str(resource.status).lower()
+        if normalized in {"failed", "error"}:
+            return "failed"
+        if normalized in {
+            "dry-run",
+            "created",
+            "running",
+            "loading",
+            "pending",
+            "starting",
+            "booting",
+            "bootstrapping",
+        }:
+            return "bootstrapping"
+        return "provisioning"
 
     def _resolve_blueprint(self, request: ProvisionRequest) -> ProviderBlueprint | None:
         if request.blueprint_id is None:

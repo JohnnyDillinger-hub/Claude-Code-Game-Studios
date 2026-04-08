@@ -259,6 +259,43 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(reconciled_jobs[0].status, "bootstrapping")
         self.assertIsNone(reconciled_jobs[0].joined_node_id)
 
+    def test_provider_service_waits_for_join_during_provision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "jobs.json"
+            state_file = Path(tmpdir) / "cluster-registry.json"
+            RegistryStateStore(state_file).save(
+                NodeRegistry(
+                    [
+                        NodeInventory(
+                            node_id="vast-node-known",
+                            host="198.51.100.44",
+                            lease=LeaseInfo(
+                                available_until=parse_datetime("2035-01-01T00:00:00Z")
+                            ),
+                        )
+                    ]
+                )
+            )
+            service = ProviderService(jobs_file=jobs_file)
+
+            with patch.object(service, "_generate_node_id", return_value="vast-node-known"):
+                job = service.provision_with_join_wait(
+                    ProvisionRequest(
+                        provider="vast",
+                        blueprint_id="qwen-coder-node-vast",
+                        dry_run=True,
+                    ),
+                    wait_for_join=True,
+                    join_state_file=state_file,
+                    join_timeout_seconds=0.0,
+                    join_poll_interval_seconds=0.1,
+                )
+
+        self.assertEqual(job.status, "joined")
+        self.assertEqual(job.joined_node_id, "vast-node-known")
+        assert job.provisioned_resource is not None
+        self.assertEqual(job.provisioned_resource.status, "joined")
+
     def test_vast_adapter_real_create_normalizes_created_instance(self) -> None:
         adapter = VastAdapter(api_key="test-token")
         service = ProviderService(adapters=(adapter,))
@@ -371,3 +408,49 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(reconciled["status"], "joined")
         self.assertEqual(reconciled["joined_node_id"], created["bootstrap_bundle"]["node_id"])
         self.assertEqual(persisted.status, "joined")
+
+    def test_clusterctl_provision_wait_for_join_returns_joined_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "provider-jobs.json"
+            state_file = Path(tmpdir) / "cluster-registry.json"
+            RegistryStateStore(state_file).save(
+                NodeRegistry(
+                    [
+                        NodeInventory(
+                            node_id="vast-node-cli",
+                            host="203.0.113.77",
+                            lease=LeaseInfo(
+                                available_until=parse_datetime("2035-01-01T00:00:00Z")
+                            ),
+                        )
+                    ]
+                )
+            )
+
+            buffer = io.StringIO()
+            with patch.object(ProviderService, "_generate_node_id", return_value="vast-node-cli"):
+                with redirect_stdout(buffer):
+                    exit_code = clusterctl_main(
+                        [
+                            "providers-provision",
+                            "--provider",
+                            "vast",
+                            "--blueprint",
+                            "qwen-coder-node-vast",
+                            "--dry-run",
+                            "--jobs-file",
+                            str(jobs_file),
+                            "--wait-for-join",
+                            "--join-state-file",
+                            str(state_file),
+                            "--join-timeout-seconds",
+                            "0",
+                            "--join-poll-interval-seconds",
+                            "0.1",
+                        ]
+                    )
+            payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "joined")
+        self.assertEqual(payload["joined_node_id"], "vast-node-cli")

@@ -768,6 +768,10 @@ def build_parser() -> argparse.ArgumentParser:
     provider_provision_parser.add_argument("--heartbeat-state-file")
     provider_provision_parser.add_argument("--repo-clone-url")
     provider_provision_parser.add_argument("--repo-branch")
+    provider_provision_parser.add_argument("--wait-for-join", action="store_true")
+    provider_provision_parser.add_argument("--join-state-file", default=str(DEFAULT_STATE_FILE))
+    provider_provision_parser.add_argument("--join-timeout-seconds", type=float, default=120.0)
+    provider_provision_parser.add_argument("--join-poll-interval-seconds", type=float, default=5.0)
 
     provider_jobs_parser = subparsers.add_parser(
         "providers-jobs",
@@ -1204,7 +1208,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         try:
             provision_request = _build_provision_request(args)
-            job = service.provision(provision_request)
+            job = service.provision_with_join_wait(
+                provision_request,
+                wait_for_join=bool(args.wait_for_join),
+                join_state_file=args.join_state_file,
+                join_timeout_seconds=args.join_timeout_seconds,
+                join_poll_interval_seconds=args.join_poll_interval_seconds,
+            )
         except (ProviderError, ValueError) as exc:
             print(json.dumps({"status": "failed", "reason": str(exc)}, indent=2, sort_keys=True))
             return 1

@@ -38,8 +38,9 @@ These objects are intentionally separate from [NodeInventory](/Users/ivandry/Git
 1. `providers-list-offers` asks provider adapters for normalized capacity.
 2. `providers-list-blueprints` exposes built-in presets.
 3. `providers-provision` validates a request, picks an offer, creates a provisioning job, and emits a bootstrap bundle.
-4. `providers-reconcile-jobs` matches provisioning jobs back to the cluster registry by generated `node_id`.
-5. The created external resource is still outside the mesh until node-agent heartbeat happens.
+4. `providers-provision --wait-for-join` can synchronously poll the registry and return once the job becomes `joined`.
+5. `providers-reconcile-jobs` matches provisioning jobs back to the cluster registry by generated `node_id`.
+6. The created external resource is still outside the mesh until node-agent heartbeat happens.
 
 ## Bootstrap Strategy
 
@@ -78,7 +79,7 @@ That separation keeps the existing cluster orchestration stable while we add pro
 
 ## Recommended Next Steps
 
-1. Add automatic waiting and polling after real `Vast` create so a job can move from `bootstrapping` to `joined` without a separate manual reconcile step.
+1. Turn the current synchronous join wait into a background job or API-friendly async watcher.
 2. Port the same real create pattern to `runpod`.
 3. Expose the same provider service through a thin HTTP API for the GUI.
 4. Add policy controls only after provisioning and joining are reliable.

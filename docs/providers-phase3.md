@@ -38,6 +38,13 @@ Current provider commands in [clusterctl.py](/Users/ivandry/GitHub/Claude-Code-G
 - `providers-jobs`
 - `providers-reconcile-jobs`
 
+`providers-provision` can now also wait for join confirmation in the same call:
+
+- `--wait-for-join`
+- `--join-state-file`
+- `--join-timeout-seconds`
+- `--join-poll-interval-seconds`
+
 ## Discovery Vs Provisioning Vs Joining
 
 Discovery:
@@ -57,6 +64,7 @@ Provisioning:
 Joining:
 
 - Still depends on the existing node agent starting and heartbeating into the registry.
+- Can now be waited for directly during `providers-provision` when the caller passes `--wait-for-join`.
 - Can now be confirmed from provider jobs through `providers-reconcile-jobs`.
 - Marks the job as `joined`, captures the matched `node_id`, and stores a snapshot of the joined node.
 - Only after that does the resource become `NodeInventory` and participate in scheduling.
@@ -71,7 +79,7 @@ This phase intentionally does not implement:
 - full secret management UX
 - automatic NAT traversal
 - full provider create flows in production mode for `runpod` and `nebius`
-- automatic waiting/polling for cluster join after provisioning
+- background async waiting/polling for cluster join after provisioning
 
 ## Managed Vs Bring Your Own Provider
 
