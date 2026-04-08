@@ -228,6 +228,39 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--disable-custom-all-reduce", command)
         self.assertIn("--disable-cuda-graph", command)
 
+    def test_build_worker_command_respects_sglang_cuda_graph_overrides(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-sglang-tp2").with_launch_overrides(
+            {
+                "disable_cuda_graph": False,
+                "cuda_graph_max_bs": 32,
+            }
+        )
+        request = AgentRequest(
+            agent_id="agent-sglang-cudagraph",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-sg2",
+            host="10.0.0.61",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32100,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertNotIn("--disable-cuda-graph", command)
+        self.assertIn("--cuda-graph-max-bs", command)
+        self.assertIn("32", command)
+
     def test_vllm_server_command_and_port_are_single_gpu_deterministic(self) -> None:
         command = build_vllm_server_command(
             python_executable="python3",

@@ -19,7 +19,11 @@ from cluster.node_agent.heartbeat import (
 )
 from cluster.node_agent.probe_gpu import ProbeError, build_local_inventory, parse_label_items
 from cluster.orchestrator.launcher import build_remote_ssh_argv, launch_agent
-from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
+from cluster.orchestrator.model_profiles import (
+    RuntimeProfile,
+    get_runtime_profile,
+    load_runtime_profiles,
+)
 from cluster.orchestrator.remote_sessions import RemoteSessionClaim
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.scheduler import schedule_agent
@@ -34,6 +38,7 @@ DEFAULT_REMOTE_SESSION_DIR = "production/session-state/remote-workers"
 DEFAULT_REPO_ROOT = "$HOME/Claude-Code-Game-Studios"
 DEFAULT_SSH_USER = "root"
 PROVIDER_CHOICES = ("vast", "runpod", "nebius")
+CUDA_GRAPH_MODE_CHOICES = ("profile-default", "enabled", "disabled")
 
 
 def _resolve_inventory_path(path: str | None, default_path: Path) -> Path:
@@ -158,6 +163,25 @@ def _build_provision_request(args: argparse.Namespace) -> ProvisionRequest:
         dry_run=bool(getattr(args, "dry_run", False)),
         provider_options=_parse_provider_options(getattr(args, "provider_option", []) or ()),
     )
+
+
+def _apply_launch_profile_overrides(
+    profile: RuntimeProfile,
+    args: argparse.Namespace,
+) -> RuntimeProfile:
+    overrides: dict[str, object] = {}
+    cuda_graph_mode = getattr(args, "cuda_graph_mode", "profile-default")
+    cuda_graph_max_bs = getattr(args, "cuda_graph_max_bs", None)
+    if cuda_graph_mode != "profile-default" or cuda_graph_max_bs is not None:
+        if profile.runtime_adapter != "sglang-server":
+            raise ValueError("CUDA graph overrides are currently supported only for SGLang profiles")
+        if cuda_graph_mode == "enabled":
+            overrides["disable_cuda_graph"] = False
+        elif cuda_graph_mode == "disabled":
+            overrides["disable_cuda_graph"] = True
+        if cuda_graph_max_bs is not None:
+            overrides["cuda_graph_max_bs"] = int(cuda_graph_max_bs)
+    return profile.with_launch_overrides(overrides)
 
 
 def _build_remote_inventory_probe_command(
@@ -632,6 +656,12 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
     launch_parser.add_argument("--probe-remote-sessions", action="store_true")
     launch_parser.add_argument("--min-lease-remaining-seconds", type=int, default=30)
+    launch_parser.add_argument(
+        "--cuda-graph-mode",
+        choices=CUDA_GRAPH_MODE_CHOICES,
+        default="profile-default",
+    )
+    launch_parser.add_argument("--cuda-graph-max-bs", type=int)
 
     session_list_parser = subparsers.add_parser(
         "list-remote-sessions",
@@ -887,6 +917,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         ]
         request = _build_request(args)
         profile = get_runtime_profile(args.profile)
+        try:
+            profile = _apply_launch_profile_overrides(profile, args)
+        except ValueError as exc:
+            print(
+                json.dumps(
+                    {
+                        "launch": {
+                            "status": "blocked",
+                            "reason": str(exc),
+                        }
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
         claim_summaries: list[dict[str, object]] = []
         if args.probe_remote_sessions and remote_nodes:
             try:

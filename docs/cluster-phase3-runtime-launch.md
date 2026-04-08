@@ -51,6 +51,17 @@ This uses the same single-node multi-GPU reservation model as `vllm`, with
 dedicated profiles such as `qwen-coder-30b-sglang-tp2` and
 `qwen-coder-30b-sglang-tp4`.
 
+`launch-agent` also supports request-level CUDA graph overrides for SGLang:
+
+- `--cuda-graph-mode profile-default`
+- `--cuda-graph-mode enabled`
+- `--cuda-graph-mode disabled`
+- `--cuda-graph-max-bs N`
+
+This lets the client keep the profile default for a known-good node, or
+explicitly force the runtime to start with or without CUDA graph capture for a
+particular launch.
+
 ### Python / Hugging Face
 
 For `python-hf` profiles, the worker runs a one-shot probe on the target GPU and

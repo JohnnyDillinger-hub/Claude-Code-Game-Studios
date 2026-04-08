@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import json
 from typing import Any
@@ -114,6 +114,26 @@ class RuntimeProfile:
             "runtime_options": dict(self.runtime_options),
             "launch": dict(self.launch_metadata),
         }
+
+    def with_launch_overrides(self, overrides: dict[str, Any]) -> "RuntimeProfile":
+        if not overrides:
+            return self
+        launch_metadata = dict(self.launch_metadata)
+        runtime_options = dict(self.runtime_options)
+        for key, value in overrides.items():
+            if value is None:
+                launch_metadata.pop(key, None)
+                runtime_options.pop(key, None)
+            else:
+                launch_metadata[key] = value
+                runtime_options[key] = value
+        launch_metadata["runtime_adapter"] = self.runtime_adapter
+        launch_metadata["runtime_options"] = dict(runtime_options)
+        return replace(
+            self,
+            runtime_options=runtime_options,
+            launch_metadata=launch_metadata,
+        )
 
 
 def load_runtime_profiles(path: str | Path | None = None) -> dict[str, RuntimeProfile]:
