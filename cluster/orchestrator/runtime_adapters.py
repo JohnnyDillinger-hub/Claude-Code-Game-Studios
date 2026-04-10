@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import signal
 import shutil
 import subprocess
 import time
@@ -28,7 +30,12 @@ DEFAULT_SGLANG_LAUNCH_MODULE = "sglang.launch_server"
 DEFAULT_TRTLLM_PORT_BASE = 20000
 DEFAULT_TRTLLM_EXECUTABLE = "trtllm-serve"
 DEFAULT_TRTLLM_BACKEND = "pytorch"
+DEFAULT_DEEPSPEED_PORT_BASE = 21000
+DEFAULT_DEEPSPEED_EXECUTABLE = "deepspeed"
+DEFAULT_DEEPSPEED_DTYPE = "fp16"
 DEFAULT_MEM_FRACTION_STATIC = 0.9
+DEFAULT_STALE_STARTING_SECONDS = 900
+DEFAULT_PROCESS_STOP_GRACE_SECONDS = 2.0
 SESSION_OK_STATUSES = {"starting", "launched", "reused"}
 
 
@@ -53,6 +60,7 @@ class WorkerSession:
     endpoint_url: str | None = None
     listen_port: int | None = None
     server_pid: int | None = None
+    process_group_id: int | None = None
     stdout_log: str | None = None
     stderr_log: str | None = None
     warmup_response: str | None = None
@@ -84,6 +92,8 @@ class WorkerSession:
             payload["listen_port"] = self.listen_port
         if self.server_pid is not None:
             payload["server_pid"] = self.server_pid
+        if self.process_group_id is not None:
+            payload["process_group_id"] = self.process_group_id
         if self.stdout_log is not None:
             payload["stdout_log"] = self.stdout_log
         if self.stderr_log is not None:
@@ -103,8 +113,23 @@ def utc_timestamp() -> str:
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def resolve_user_home_dir() -> str:
+    try:
+        passwd_home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        passwd_home = ""
+    env_home = os.environ.get("HOME", "")
+    return passwd_home or env_home or "~"
+
+
 def expand_path_text(value: str) -> str:
-    return os.path.expanduser(os.path.expandvars(value))
+    home_dir = resolve_user_home_dir()
+    expanded = value.replace("${HOME}", home_dir).replace("$HOME", home_dir)
+    if expanded == "~":
+        return home_dir
+    if expanded.startswith("~/"):
+        return str(Path(home_dir) / expanded[2:])
+    return os.path.expanduser(os.path.expandvars(expanded))
 
 
 def choose_runtime_port(port_base: int, gpu_index: int) -> int:
@@ -192,6 +217,7 @@ def build_sglang_server_command(
     disable_custom_all_reduce: bool = False,
     disable_overlap_schedule: bool = False,
     disable_cuda_graph: bool = False,
+    disable_piecewise_cuda_graph: bool = True,
     cuda_graph_max_bs: int | None = None,
 ) -> list[str]:
     command = [
@@ -221,6 +247,8 @@ def build_sglang_server_command(
         command.append("--disable-overlap-schedule")
     if disable_cuda_graph:
         command.append("--disable-cuda-graph")
+    if disable_piecewise_cuda_graph:
+        command.append("--disable-piecewise-cuda-graph")
     if cuda_graph_max_bs is not None:
         command.extend(["--cuda-graph-max-bs", str(cuda_graph_max_bs)])
     return command
@@ -269,6 +297,65 @@ def build_trtllm_serve_command(
     return command
 
 
+def build_deepspeed_server_command(
+    *,
+    executable: str,
+    host: str,
+    port: int,
+    model: str,
+    tensor_parallel_size: int,
+    script_path: str | None = None,
+    launch_module: str | None = None,
+    dtype: str = DEFAULT_DEEPSPEED_DTYPE,
+    kernel_inject: bool = True,
+    enable_cuda_graph: bool = False,
+    use_triton: bool = False,
+    triton_autotune: bool = False,
+    checkpoint_dir: str | None = None,
+    max_model_len: int | None = None,
+) -> list[str]:
+    command = [
+        executable,
+        "--num_gpus",
+        str(tensor_parallel_size),
+    ]
+    if launch_module is not None:
+        command.extend(["--module", launch_module])
+    elif script_path is not None:
+        command.append(script_path)
+    else:
+        raise WorkerError(
+            "DeepSpeed launch requires either --script-path or --deepspeed-launch-module"
+        )
+    command.extend(
+        [
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--model",
+            model,
+            "--tensor-parallel-size",
+            str(tensor_parallel_size),
+            "--dtype",
+            dtype,
+        ]
+    )
+    if max_model_len is not None:
+        command.extend(["--max-model-len", str(max_model_len)])
+    if kernel_inject:
+        command.append("--kernel-inject")
+    if enable_cuda_graph:
+        command.append("--enable-cuda-graph")
+    if use_triton:
+        command.append("--use-triton")
+    if triton_autotune:
+        command.append("--triton-autotune")
+    if checkpoint_dir is not None:
+        command.extend(["--checkpoint-dir", checkpoint_dir])
+    return command
+
+
 def infer_packaged_cuda_home(python_executable: str) -> str | None:
     python_path = Path(expand_path_text(python_executable))
     venv_root = python_path.parent.parent
@@ -276,6 +363,7 @@ def infer_packaged_cuda_home(python_executable: str) -> str | None:
     for nvidia_root in sorted(venv_root.glob("lib/python*/site-packages/nvidia")):
         candidate_paths.extend(
             [
+                nvidia_root / "cuda_nvcc",
                 nvidia_root / "cuda_runtime",
                 nvidia_root / "cu13",
                 nvidia_root / "cu12",
@@ -284,10 +372,215 @@ def infer_packaged_cuda_home(python_executable: str) -> str | None:
         for child in sorted(nvidia_root.iterdir()):
             if child.is_dir() and child.name.startswith("cu") and child not in candidate_paths:
                 candidate_paths.append(child)
+    fallback_candidate: Path | None = None
+    fallback_nvcc_candidate: Path | None = None
     for candidate in candidate_paths:
+        if fallback_candidate is None and candidate.exists():
+            fallback_candidate = candidate
+        if fallback_nvcc_candidate is None and (candidate / "bin" / "nvcc").exists():
+            fallback_nvcc_candidate = candidate
+            if (candidate / "include").exists() or (candidate / "nvvm").exists():
+                return str(candidate)
         if (candidate / "include" / "cuda_runtime.h").exists():
+            if fallback_nvcc_candidate is not None:
+                return str(fallback_nvcc_candidate)
+            return str(candidate)
+    if fallback_nvcc_candidate is not None:
+        return str(fallback_nvcc_candidate)
+    return str(fallback_candidate) if fallback_candidate is not None else None
+
+
+def infer_packaged_nvcc_path(executable_path: str) -> str | None:
+    executable = Path(expand_path_text(executable_path))
+    venv_root = executable.parent.parent
+    for nvidia_root in sorted(venv_root.glob("lib/python*/site-packages/nvidia")):
+        for candidate in (
+            nvidia_root / "cuda_nvcc" / "bin" / "nvcc",
+            nvidia_root / "cuda_runtime" / "bin" / "nvcc",
+        ):
+            if candidate.exists():
+                return str(candidate.resolve())
+    return None
+
+
+def infer_system_nvcc_path() -> str | None:
+    nvcc_path = shutil.which("nvcc")
+    if nvcc_path is not None:
+        return str(Path(nvcc_path).resolve())
+    for candidate in [
+        Path("/usr/local/cuda/bin/nvcc"),
+        *sorted(Path("/usr/local").glob("cuda-*/bin/nvcc"), reverse=True),
+    ]:
+        if candidate.exists():
+            return str(candidate.resolve())
+    return None
+
+
+def infer_system_cuda_home() -> str | None:
+    nvcc_path = infer_system_nvcc_path()
+    if nvcc_path is not None:
+        return str(Path(nvcc_path).parent.parent)
+    for candidate in (
+        Path("/usr/local/cuda"),
+        *sorted(Path("/usr/local").glob("cuda-*"), reverse=True),
+    ):
+        if (candidate / "bin" / "nvcc").exists():
             return str(candidate)
     return None
+
+
+def infer_packaged_cuda_bin_dirs(executable_path: str) -> tuple[str, ...]:
+    executable = Path(expand_path_text(executable_path))
+    venv_root = executable.parent.parent
+    directories: list[str] = []
+    for nvidia_root in sorted(venv_root.glob("lib/python*/site-packages/nvidia")):
+        for candidate in (
+            nvidia_root / "cuda_runtime" / "bin",
+            nvidia_root / "cuda_nvcc" / "bin",
+        ):
+            if candidate.is_dir():
+                value = str(candidate)
+                if value not in directories:
+                    directories.append(value)
+    return tuple(directories)
+
+
+def infer_runtime_python_executable(executable_path: str) -> str | None:
+    executable = Path(expand_path_text(executable_path))
+    venv_root = executable.parent.parent
+    for candidate_name in ("python", "python3"):
+        candidate = venv_root / "bin" / candidate_name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def infer_torch_cuda_release(executable_path: str) -> str | None:
+    python_executable = infer_runtime_python_executable(executable_path)
+    if python_executable is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                python_executable,
+                "-c",
+                "import torch; print(torch.version.cuda or '')",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    release = result.stdout.strip()
+    return release or None
+
+
+def _write_nvcc_version_shim(target_path: Path, cuda_release: str) -> None:
+    target_path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                'if [ "${1:-}" = "-V" ] || [ "${1:-}" = "--version" ]; then',
+                f'  echo "Cuda compilation tools, release {cuda_release}, V{cuda_release}.0"',
+                "  exit 0",
+                "fi",
+                'echo "nvcc shim: a real nvcc compiler is not installed in this runtime environment" >&2',
+                "exit 1",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    target_path.chmod(0o755)
+
+
+def repair_packaged_runtime_nvcc_link(
+    executable_path: str,
+    *,
+    allow_version_shim: bool = False,
+) -> dict[str, Any]:
+    executable = Path(expand_path_text(executable_path))
+    venv_root = executable.parent.parent
+    selected_nvcc = infer_packaged_nvcc_path(executable_path) or infer_system_nvcc_path()
+    result: dict[str, Any] = {
+        "attempted": False,
+        "updated": False,
+        "runtime_bin": None,
+        "nvcc_path": selected_nvcc,
+        "shimmed": False,
+    }
+    for nvidia_root in sorted(venv_root.glob("lib/python*/site-packages/nvidia")):
+        runtime_bin = nvidia_root / "cuda_runtime" / "bin"
+        target_link = runtime_bin / "nvcc"
+        result["runtime_bin"] = str(runtime_bin)
+        result["attempted"] = True
+        runtime_bin.mkdir(parents=True, exist_ok=True)
+
+        if selected_nvcc is None and allow_version_shim:
+            cuda_release = infer_torch_cuda_release(executable_path)
+            if cuda_release:
+                if target_link.exists():
+                    if target_link.is_symlink():
+                        target_link.unlink()
+                    elif os.access(target_link, os.X_OK):
+                        return result
+                    else:
+                        target_link.unlink()
+                elif target_link.is_symlink():
+                    target_link.unlink()
+                _write_nvcc_version_shim(target_link, cuda_release)
+                result["updated"] = True
+                result["shimmed"] = True
+                result["nvcc_path"] = str(target_link)
+            return result
+
+        if selected_nvcc is None:
+            return result
+        desired = Path(selected_nvcc)
+
+        if target_link.exists():
+            try:
+                if target_link.resolve() == desired.resolve():
+                    return result
+            except OSError:
+                pass
+            if target_link.is_symlink():
+                target_link.unlink()
+            elif os.access(target_link, os.X_OK):
+                return result
+            else:
+                target_link.unlink()
+        elif target_link.is_symlink():
+            target_link.unlink()
+
+        target_link.symlink_to(desired)
+        result["updated"] = True
+        return result
+    return result
+
+
+def launch_module_supports_flag(
+    python_executable: str,
+    launch_module: str,
+    flag: str,
+    *,
+    timeout_seconds: int = 30,
+) -> bool:
+    try:
+        result = subprocess.run(
+            [python_executable, "-m", launch_module, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    help_text = f"{result.stdout}\n{result.stderr}"
+    return flag in help_text
 
 
 def prepend_executable_dir_to_path(env: dict[str, str], executable_path: str) -> None:
@@ -510,6 +803,267 @@ def session_payload_tensor_parallel_size(payload: dict[str, Any]) -> int:
         return 1
 
 
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if coerced > 0 else None
+
+
+def session_payload_process_group_id(payload: dict[str, Any]) -> int | None:
+    explicit_group_id = _coerce_positive_int(payload.get("process_group_id"))
+    if explicit_group_id is not None:
+        return explicit_group_id
+    return _coerce_positive_int(payload.get("server_pid"))
+
+
+def session_payload_process_is_alive(payload: dict[str, Any]) -> bool:
+    pid = _coerce_positive_int(payload.get("server_pid"))
+    if pid is None:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def list_process_group_members(process_group_id: int) -> list[dict[str, Any]]:
+    if process_group_id <= 0:
+        return []
+    completed = subprocess.run(
+        ["ps", "-ax", "-o", "pid=,pgid=,command="],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    members: list[dict[str, Any]] = []
+    for raw_line in (completed.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        if pgid != process_group_id:
+            continue
+        members.append({"pid": pid, "pgid": pgid, "command": parts[2]})
+    return members
+
+
+def session_payload_runtime_markers(payload: dict[str, Any]) -> tuple[str, ...]:
+    backend = str(payload.get("backend") or "")
+    runtime_markers: dict[str, tuple[str, ...]] = {
+        "ollama": ("ollama",),
+        "vllm": ("vllm.entrypoints.openai.api_server", "VLLM::EngineCore", "VLLM::Worker"),
+        "sglang": ("sglang.launch_server", "sglang"),
+        "deepspeed": ("deepspeed", "server_qwen_coder.py"),
+        "tensorrt-llm": ("trtllm-serve", "tensorrt_llm", "TensorRT-LLM"),
+        "trtllm": ("trtllm-serve", "tensorrt_llm", "TensorRT-LLM"),
+        "python-hf": ("infer_gemma_pt.py",),
+    }
+    markers: list[str] = list(runtime_markers.get(backend, ()))
+    command = payload.get("command")
+    if isinstance(command, list):
+        for item in command:
+            text = str(item).strip()
+            if not text:
+                continue
+            basename = Path(text).name
+            if len(basename) >= 3:
+                markers.append(basename)
+            if "." in text or "/" in text:
+                markers.append(text)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for marker in markers:
+        normalized = marker.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return tuple(deduped)
+
+
+def _process_group_matches_runtime(
+    members: list[dict[str, Any]],
+    *,
+    markers: tuple[str, ...],
+) -> bool:
+    if not members:
+        return False
+    if not markers:
+        return True
+    lower_markers = tuple(marker.lower() for marker in markers)
+    for member in members:
+        command = str(member.get("command") or "").lower()
+        if any(marker in command for marker in lower_markers):
+            return True
+    return False
+
+
+def terminate_session_processes(
+    payload: dict[str, Any],
+    *,
+    grace_seconds: float = DEFAULT_PROCESS_STOP_GRACE_SECONDS,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "attempted": False,
+        "signaled": False,
+        "used_force_kill": False,
+        "target": "none",
+    }
+    process_group_id = session_payload_process_group_id(payload)
+    server_pid = _coerce_positive_int(payload.get("server_pid"))
+
+    if process_group_id is not None:
+        try:
+            members_before = list_process_group_members(process_group_id)
+        except (OSError, subprocess.SubprocessError):
+            members_before = []
+        result["process_group_id"] = process_group_id
+        result["members_before"] = members_before
+        markers = session_payload_runtime_markers(payload)
+        if members_before and _process_group_matches_runtime(members_before, markers=markers):
+            result["attempted"] = True
+            result["target"] = "process-group"
+            try:
+                os.killpg(process_group_id, signal.SIGTERM)
+                result["signaled"] = True
+            except ProcessLookupError:
+                result["already_gone"] = True
+            except PermissionError:
+                result["permission_denied"] = True
+            except OSError:
+                result["signal_error"] = True
+            if result["signaled"]:
+                deadline = time.monotonic() + max(float(grace_seconds), 0.0)
+                members_after = members_before
+                while True:
+                    try:
+                        members_after = list_process_group_members(process_group_id)
+                    except (OSError, subprocess.SubprocessError):
+                        members_after = []
+                    if not members_after:
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.1)
+                result["members_after_term"] = members_after
+                if members_after:
+                    try:
+                        os.killpg(process_group_id, signal.SIGKILL)
+                        result["used_force_kill"] = True
+                    except ProcessLookupError:
+                        result["already_gone"] = True
+                    except PermissionError:
+                        result["permission_denied"] = True
+                    except OSError:
+                        result["signal_error"] = True
+                    try:
+                        result["members_after_kill"] = list_process_group_members(process_group_id)
+                    except (OSError, subprocess.SubprocessError):
+                        result["members_after_kill"] = []
+            return result
+        if members_before:
+            result["skipped_reason"] = "process-group-not-owned-by-managed-runtime"
+
+    if server_pid is None:
+        return result
+    result["server_pid"] = server_pid
+    result["attempted"] = True
+    result["target"] = "pid"
+    try:
+        os.kill(server_pid, signal.SIGTERM)
+        result["signaled"] = True
+    except ProcessLookupError:
+        result["already_gone"] = True
+        return result
+    except PermissionError:
+        result["permission_denied"] = True
+        return result
+    except OSError:
+        result["signal_error"] = True
+        return result
+    deadline = time.monotonic() + max(float(grace_seconds), 0.0)
+    while True:
+        if not session_payload_process_is_alive({"server_pid": server_pid}):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if session_payload_process_is_alive({"server_pid": server_pid}):
+        try:
+            os.kill(server_pid, signal.SIGKILL)
+            result["used_force_kill"] = True
+        except ProcessLookupError:
+            result["already_gone"] = True
+        except PermissionError:
+            result["permission_denied"] = True
+        except OSError:
+            result["signal_error"] = True
+    return result
+
+
+def _parse_session_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def session_payload_is_stale_starting(
+    payload: dict[str, Any],
+    *,
+    stale_after_seconds: int = DEFAULT_STALE_STARTING_SECONDS,
+    now: datetime | None = None,
+) -> bool:
+    if stale_after_seconds <= 0:
+        return False
+    if str(payload.get("status") or "") != "starting":
+        return False
+    launched_at = _parse_session_timestamp(payload.get("launched_at"))
+    if launched_at is None:
+        return False
+    current_time = now or datetime.now(tz=timezone.utc)
+    return (current_time - launched_at).total_seconds() >= stale_after_seconds
+
+
+def reap_stale_session_payload(path: Path, payload: dict[str, Any], *, reason: str) -> dict[str, Any] | None:
+    previous_status = str(payload.get("status") or "")
+    if previous_status not in SESSION_OK_STATUSES:
+        return None
+    updated = dict(payload)
+    updated["status"] = "failed" if previous_status == "starting" else "stopped"
+    updated["reused"] = False
+    updated["reap_reason"] = reason
+    updated["reaped_at"] = utc_timestamp()
+    notes = str(updated.get("notes") or "").strip()
+    suffix = f"Session reaped automatically ({reason})."
+    updated["notes"] = f"{notes} {suffix}".strip() if notes else suffix
+    write_session_payload(path, updated)
+    return updated
+
+
 def find_conflicting_session(
     session_dir: Path,
     *,
@@ -522,9 +1076,21 @@ def find_conflicting_session(
     if not session_dir.exists():
         return None
     requested_gpu_indices = gpu_indices or (gpu_index,)
+    stale_reason = f"stale-starting>{DEFAULT_STALE_STARTING_SECONDS}s"
     for candidate in sorted(session_dir.glob("*.json")):
         payload = load_session_payload(candidate)
         if payload is None:
+            continue
+        if not session_payload_process_is_alive(payload):
+            terminate_session_processes(payload)
+            reap_stale_session_payload(candidate, payload, reason="dead-server-pid")
+            continue
+        if session_payload_is_stale_starting(
+            payload,
+            stale_after_seconds=DEFAULT_STALE_STARTING_SECONDS,
+        ):
+            terminate_session_processes(payload)
+            reap_stale_session_payload(candidate, payload, reason=stale_reason)
             continue
         if payload.get("agent_id") == agent_id:
             continue
@@ -553,6 +1119,8 @@ def resolve_launch_mode(args: argparse.Namespace) -> str:
         return "sglang-server"
     if backend in {"tensorrt-llm", "trtllm"}:
         return "trtllm-server"
+    if backend == "deepspeed":
+        return "deepspeed-server"
     if backend == "python-hf":
         return "python-hf-probe"
     raise WorkerError(f"Unsupported backend {backend!r}")
@@ -715,6 +1283,14 @@ class OllamaAdapter:
             stdout_log=stdout_log,
             stderr_log=stderr_log,
         )
+        write_session_payload(
+            session_path,
+            {
+                **(load_session_payload(session_path) or {}),
+                "server_pid": server_pid,
+                "process_group_id": server_pid,
+            },
+        )
         wait_for_json_endpoint(
             [health_url],
             startup_timeout_seconds=args.startup_timeout_seconds,
@@ -754,6 +1330,7 @@ class OllamaAdapter:
             endpoint_url=endpoint_url,
             listen_port=port,
             server_pid=server_pid,
+            process_group_id=server_pid,
             stdout_log=str(stdout_log),
             stderr_log=str(stderr_log),
             warmup_response=response_text,
@@ -899,6 +1476,14 @@ class VllmAdapter:
             stdout_log=stdout_log,
             stderr_log=stderr_log,
         )
+        write_session_payload(
+            session_path,
+            {
+                **(load_session_payload(session_path) or {}),
+                "server_pid": server_pid,
+                "process_group_id": server_pid,
+            },
+        )
         ready_url, _ = wait_for_json_endpoint(
             health_candidates,
             startup_timeout_seconds=args.startup_timeout_seconds,
@@ -920,6 +1505,7 @@ class VllmAdapter:
             endpoint_url=endpoint_url,
             listen_port=port,
             server_pid=server_pid,
+            process_group_id=server_pid,
             stdout_log=str(stdout_log),
             stderr_log=str(stderr_log),
             command=command,
@@ -975,6 +1561,11 @@ class SglangAdapter:
             disable_custom_all_reduce=args.disable_custom_all_reduce,
             disable_overlap_schedule=args.disable_overlap_schedule,
             disable_cuda_graph=args.disable_cuda_graph,
+            disable_piecewise_cuda_graph=launch_module_supports_flag(
+                python_executable,
+                args.sglang_launch_module,
+                "--disable-piecewise-cuda-graph",
+            ),
             cuda_graph_max_bs=args.cuda_graph_max_bs,
         )
         if (
@@ -1038,10 +1629,213 @@ class SglangAdapter:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         prepend_executable_dir_to_path(env, python_executable)
+        repair_packaged_runtime_nvcc_link(python_executable)
+        prepend_env_path_entries(env, "PATH", infer_packaged_cuda_bin_dirs(python_executable))
         cuda_home = (
             env.get("CUDA_HOME")
             or env.get("CUDA_PATH")
             or infer_packaged_cuda_home(python_executable)
+            or infer_system_cuda_home()
+        )
+        if cuda_home is not None:
+            env.setdefault("CUDA_HOME", cuda_home)
+            env.setdefault("CUDA_PATH", cuda_home)
+        server_pid = start_background_process(
+            command,
+            env=env,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+        )
+        write_session_payload(
+            session_path,
+            WorkerSession(
+                status="starting",
+                agent_id=args.agent_id,
+                node_id=args.node_id,
+                backend=args.backend,
+                runtime_class=args.runtime_class,
+                model=args.model,
+                gpu_index=args.gpu_index,
+                gpu_indices=gpu_indices,
+                tensor_parallel_size=args.tensor_parallel_size,
+                single_gpu_only=len(gpu_indices) == 1,
+                launched_at=utc_timestamp(),
+                session_file=str(session_path),
+                endpoint_url=endpoint_url,
+                listen_port=port,
+                server_pid=server_pid,
+                process_group_id=server_pid,
+                stdout_log=str(stdout_log),
+                stderr_log=str(stderr_log),
+                command=command,
+                health_url=health_candidates[0],
+                notes="Dedicated SGLang runtime is starting.",
+            ).to_dict(),
+        )
+
+        ready_url, _ = wait_for_json_endpoint_or_process_exit(
+            health_candidates,
+            startup_timeout_seconds=args.startup_timeout_seconds,
+            request_timeout_seconds=min(args.request_timeout_seconds, 10),
+            process_pid=server_pid,
+            process_name="SGLang server",
+            stderr_log=stderr_log,
+        )
+        session = WorkerSession(
+            status="launched",
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            backend=args.backend,
+            runtime_class=args.runtime_class,
+            model=args.model,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            tensor_parallel_size=args.tensor_parallel_size,
+            single_gpu_only=len(gpu_indices) == 1,
+            launched_at=utc_timestamp(),
+            session_file=str(session_path),
+            endpoint_url=endpoint_url,
+            listen_port=port,
+            server_pid=server_pid,
+            process_group_id=server_pid,
+            stdout_log=str(stdout_log),
+            stderr_log=str(stderr_log),
+            command=command,
+            health_url=ready_url,
+            notes="Dedicated SGLang server launched and passed a health probe.",
+        )
+        write_session_payload(session_path, session.to_dict())
+        return session
+
+
+class DeepSpeedAdapter:
+    name = "deepspeed-server"
+
+    def launch(self, args: argparse.Namespace, session_dir: Path) -> WorkerSession:
+        gpu_indices = resolve_gpu_indices(args)
+        if args.tensor_parallel_size != len(gpu_indices):
+            raise WorkerError(
+                f"tensor_parallel_size={args.tensor_parallel_size} requires exactly "
+                f"{args.tensor_parallel_size} GPUs, but gpu_indices={gpu_indices}"
+            )
+
+        deepspeed_executable = expand_path_text(args.deepspeed_executable)
+        if "/" in args.deepspeed_executable and not Path(deepspeed_executable).exists():
+            raise WorkerError(
+                f"DeepSpeed executable {deepspeed_executable!r} is not present on the target node"
+            )
+        if "/" not in args.deepspeed_executable:
+            resolved_executable = shutil.which(deepspeed_executable)
+            if resolved_executable is None:
+                raise WorkerError(
+                    f"DeepSpeed executable {deepspeed_executable!r} is not installed on the target node"
+                )
+            deepspeed_executable = resolved_executable
+
+        port_base = args.port_base or DEFAULT_DEEPSPEED_PORT_BASE
+        port = choose_runtime_port_for_group(port_base, gpu_indices)
+        conflict = find_conflicting_session(
+            session_dir,
+            agent_id=args.agent_id,
+            node_id=args.node_id,
+            gpu_index=args.gpu_index,
+            gpu_indices=gpu_indices,
+            listen_port=port,
+        )
+        if conflict is not None:
+            raise WorkerError(
+                f"GPU group {list(gpu_indices)} on {args.node_id} already has an active session for "
+                f"agent {conflict.get('agent_id')!r}"
+            )
+
+        session_path, stdout_log, stderr_log = resolve_session_paths(session_dir, args.agent_id)
+        endpoint_url = f"http://{args.server_host}:{port}"
+        health_candidates = [f"{endpoint_url}/health", f"{endpoint_url}/v1/models"]
+        existing = load_session_payload(session_path)
+        command = build_deepspeed_server_command(
+            executable=deepspeed_executable,
+            host=args.server_host,
+            port=port,
+            model=args.model,
+            tensor_parallel_size=args.tensor_parallel_size,
+            script_path=args.script_path,
+            launch_module=args.deepspeed_launch_module,
+            dtype=args.deepspeed_dtype,
+            kernel_inject=args.deepspeed_kernel_inject,
+            enable_cuda_graph=args.deepspeed_enable_cuda_graph,
+            use_triton=args.deepspeed_use_triton,
+            triton_autotune=args.deepspeed_triton_autotune,
+            checkpoint_dir=args.deepspeed_checkpoint_dir,
+            max_model_len=args.max_model_len,
+        )
+        if (
+            existing is not None
+            and existing.get("listen_port") == port
+            and existing.get("endpoint_url") == endpoint_url
+            and session_payload_gpu_indices(existing) == gpu_indices
+            and session_payload_tensor_parallel_size(existing) == args.tensor_parallel_size
+            and str(existing.get("status")) in SESSION_OK_STATUSES
+        ):
+            try:
+                ready_url, _ = wait_for_json_endpoint(
+                    health_candidates,
+                    startup_timeout_seconds=3,
+                    request_timeout_seconds=2,
+                )
+                session = WorkerSession(
+                    status="reused",
+                    agent_id=args.agent_id,
+                    node_id=args.node_id,
+                    backend=args.backend,
+                    runtime_class=args.runtime_class,
+                    model=args.model,
+                    gpu_index=args.gpu_index,
+                    gpu_indices=gpu_indices,
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    single_gpu_only=len(gpu_indices) == 1,
+                    launched_at=utc_timestamp(),
+                    session_file=str(session_path),
+                    endpoint_url=endpoint_url,
+                    listen_port=port,
+                    server_pid=(
+                        int(existing["server_pid"]) if existing.get("server_pid") is not None else None
+                    ),
+                    stdout_log=str(stdout_log),
+                    stderr_log=str(stderr_log),
+                    command=command,
+                    health_url=ready_url,
+                    reused=True,
+                    notes="Reused an existing dedicated DeepSpeed runtime for this agent.",
+                )
+                write_session_payload(session_path, session.to_dict())
+                return session
+            except (WorkerError, error.URLError, json.JSONDecodeError):
+                pass
+        try:
+            wait_for_json_endpoint(
+                health_candidates,
+                startup_timeout_seconds=1,
+                request_timeout_seconds=1,
+            )
+            raise WorkerError(
+                f"DeepSpeed endpoint {endpoint_url} is already live without a reusable session record"
+            )
+        except WorkerError as exc:
+            if "already live" in str(exc):
+                raise
+        except (error.URLError, json.JSONDecodeError):
+            pass
+
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
+        prepend_executable_dir_to_path(env, deepspeed_executable)
+        repair_packaged_runtime_nvcc_link(deepspeed_executable, allow_version_shim=True)
+        prepend_env_path_entries(env, "PATH", infer_packaged_cuda_bin_dirs(deepspeed_executable))
+        cuda_home = (
+            env.get("CUDA_HOME")
+            or env.get("CUDA_PATH")
+            or infer_packaged_cuda_home(deepspeed_executable)
+            or infer_system_cuda_home()
         )
         if cuda_home is not None:
             env.setdefault("CUDA_HOME", cuda_home)
@@ -1067,7 +1861,7 @@ class SglangAdapter:
                 stderr_log=str(stderr_log),
                 command=command,
                 health_url=health_candidates[0],
-                notes="Dedicated SGLang runtime is starting.",
+                notes="Dedicated DeepSpeed runtime is starting.",
             ).to_dict(),
         )
 
@@ -1077,10 +1871,21 @@ class SglangAdapter:
             stdout_log=stdout_log,
             stderr_log=stderr_log,
         )
-        ready_url, _ = wait_for_json_endpoint(
+        write_session_payload(
+            session_path,
+            {
+                **(load_session_payload(session_path) or {}),
+                "server_pid": server_pid,
+                "process_group_id": server_pid,
+            },
+        )
+        ready_url, _ = wait_for_json_endpoint_or_process_exit(
             health_candidates,
             startup_timeout_seconds=args.startup_timeout_seconds,
             request_timeout_seconds=min(args.request_timeout_seconds, 10),
+            process_pid=server_pid,
+            process_name="DeepSpeed server",
+            stderr_log=stderr_log,
         )
         session = WorkerSession(
             status="launched",
@@ -1098,11 +1903,12 @@ class SglangAdapter:
             endpoint_url=endpoint_url,
             listen_port=port,
             server_pid=server_pid,
+            process_group_id=server_pid,
             stdout_log=str(stdout_log),
             stderr_log=str(stderr_log),
             command=command,
             health_url=ready_url,
-            notes="Dedicated SGLang server launched and passed a health probe.",
+            notes="Dedicated DeepSpeed server launched and passed a health probe.",
         )
         write_session_payload(session_path, session.to_dict())
         return session
@@ -1233,6 +2039,8 @@ class TrtllmAdapter:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in gpu_indices)
         prepend_executable_dir_to_path(env, trtllm_executable)
+        repair_packaged_runtime_nvcc_link(trtllm_executable)
+        prepend_env_path_entries(env, "PATH", infer_packaged_cuda_bin_dirs(trtllm_executable))
         prepend_env_path_entries(env, "LD_LIBRARY_PATH", infer_packaged_library_dirs(trtllm_executable))
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         packaged_cuda_home = infer_packaged_cuda_home(trtllm_executable)
@@ -1264,6 +2072,7 @@ class TrtllmAdapter:
                 endpoint_url=endpoint_url,
                 listen_port=port,
                 server_pid=server_pid,
+                process_group_id=server_pid,
                 stdout_log=str(stdout_log),
                 stderr_log=str(stderr_log),
                 command=command,
@@ -1295,6 +2104,7 @@ class TrtllmAdapter:
             endpoint_url=endpoint_url,
             listen_port=port,
             server_pid=server_pid,
+            process_group_id=server_pid,
             stdout_log=str(stdout_log),
             stderr_log=str(stderr_log),
             command=command,
@@ -1374,6 +2184,7 @@ _RUNTIME_ADAPTERS: dict[str, RuntimeAdapter] = {
         OllamaAdapter(),
         VllmAdapter(),
         SglangAdapter(),
+        DeepSpeedAdapter(),
         TrtllmAdapter(),
         PythonHfProbeAdapter(),
     )
@@ -1396,8 +2207,12 @@ __all__ = [
     "DEFAULT_MAX_NEW_TOKENS",
     "DEFAULT_OLLAMA_PORT_BASE",
     "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "DEFAULT_DEEPSPEED_DTYPE",
+    "DEFAULT_DEEPSPEED_EXECUTABLE",
+    "DEFAULT_DEEPSPEED_PORT_BASE",
     "DEFAULT_SERVER_HOST",
     "DEFAULT_SESSION_DIR",
+    "DEFAULT_STALE_STARTING_SECONDS",
     "DEFAULT_STARTUP_TIMEOUT_SECONDS",
     "DEFAULT_SGLANG_LAUNCH_MODULE",
     "DEFAULT_SGLANG_PORT_BASE",
@@ -1412,6 +2227,7 @@ __all__ = [
     "WorkerError",
     "WorkerSession",
     "build_ollama_server_command",
+    "build_deepspeed_server_command",
     "build_sglang_server_command",
     "build_trtllm_serve_command",
     "build_vllm_server_command",
@@ -1421,8 +2237,13 @@ __all__ = [
     "expand_path_text",
     "find_conflicting_session",
     "get_runtime_adapter",
+    "infer_packaged_cuda_bin_dirs",
     "infer_packaged_cuda_home",
+    "infer_packaged_nvcc_path",
+    "infer_system_cuda_home",
+    "infer_system_nvcc_path",
     "infer_packaged_library_dirs",
+    "launch_module_supports_flag",
     "launch_with_adapter",
     "load_session_payload",
     "post_json",
@@ -1432,10 +2253,16 @@ __all__ = [
     "resolve_gpu_indices",
     "resolve_launch_mode",
     "resolve_session_paths",
+    "repair_packaged_runtime_nvcc_link",
     "sanitize_agent_id",
+    "session_payload_is_stale_starting",
+    "session_payload_process_is_alive",
     "session_payload_gpu_indices",
     "session_payload_tensor_parallel_size",
+    "reap_stale_session_payload",
+    "session_payload_process_group_id",
     "start_background_process",
+    "terminate_session_processes",
     "utc_timestamp",
     "wait_for_json_endpoint",
     "wait_for_json_endpoint_or_process_exit",

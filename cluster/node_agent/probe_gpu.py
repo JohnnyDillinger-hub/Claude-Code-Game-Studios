@@ -68,13 +68,19 @@ RUNTIME_PROBE_SPECS = (
     {
         "name": "deepspeed",
         "distribution": "deepspeed",
-        "python_candidates": ("python3",),
+        "python_candidates": (".venv-deepspeed/bin/python", "python3"),
         "supported_topologies": ("single-gpu", "tp", "pp"),
     },
     {
         "name": "transformers",
         "distribution": "transformers",
-        "python_candidates": ("python3",),
+        "python_candidates": (
+            ".venv-deepspeed/bin/python",
+            ".venv-sglang/bin/python",
+            ".venv-vllm/bin/python",
+            ".venv-trtllm/bin/python",
+            "python3",
+        ),
         "supported_topologies": ("single-gpu", "tp"),
     },
 )
@@ -126,6 +132,42 @@ def _probe_distribution_version(distribution: str, python_executable: str) -> st
         f"print(md.version({distribution!r}))"
     )
     return _read_command_text([python_executable, "-c", script])
+
+
+def _collect_python_runtime_details(python_executable: str) -> dict[str, object]:
+    raw_python_path = Path(python_executable)
+    python_path = raw_python_path.resolve()
+    venv_root = raw_python_path.parent.parent
+    details: dict[str, object] = {
+        "python_executable": str(raw_python_path),
+        "resolved_python_executable": str(python_path),
+        "venv_root": str(venv_root),
+        "system_nvcc_present": shutil.which("nvcc") is not None,
+    }
+    nvidia_root = next(iter(sorted(venv_root.glob("lib/python*/site-packages/nvidia"))), None)
+    if nvidia_root is not None:
+        details["nvidia_root"] = str(nvidia_root)
+        packaged_nvcc = nvidia_root / "cuda_nvcc" / "bin" / "nvcc"
+        runtime_nvcc = nvidia_root / "cuda_runtime" / "bin" / "nvcc"
+        cuda_runtime_root = nvidia_root / "cuda_runtime"
+        cuda_nvcc_root = nvidia_root / "cuda_nvcc"
+        details["packaged_nvcc_present"] = packaged_nvcc.exists()
+        details["runtime_nvcc_present"] = runtime_nvcc.exists()
+        if cuda_runtime_root.exists():
+            details["packaged_cuda_home"] = str(cuda_runtime_root)
+        if cuda_nvcc_root.exists():
+            details["packaged_nvcc_home"] = str(cuda_nvcc_root)
+
+    torch_cuda = _read_command_text(
+        [
+            python_executable,
+            "-c",
+            "import torch; print(torch.version.cuda or '')",
+        ]
+    )
+    if torch_cuda:
+        details["torch_cuda_version"] = torch_cuda
+    return details
 
 
 def probe_system_info(
@@ -198,6 +240,11 @@ def probe_runtime_capabilities(*, repo_root: str | Path | None = None) -> tuple[
                 version=version,
                 executable=resolved_python if version is not None else None,
                 supported_topologies=tuple(str(item) for item in spec["supported_topologies"]),
+                details=(
+                    _collect_python_runtime_details(resolved_python)
+                    if version is not None and resolved_python is not None
+                    else {}
+                ),
             )
         )
     return tuple(capabilities)
