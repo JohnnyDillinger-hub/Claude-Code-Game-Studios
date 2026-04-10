@@ -40,7 +40,9 @@ These objects are intentionally separate from [NodeInventory](/Users/ivandry/Git
 3. `providers-provision` validates a request, picks an offer, creates a provisioning job, and emits a bootstrap bundle.
 4. `providers-provision --wait-for-join` can synchronously poll the registry and return once the job becomes `joined`.
 5. `providers-reconcile-jobs` matches provisioning jobs back to the cluster registry by generated `node_id`.
-6. The created external resource is still outside the mesh until node-agent heartbeat happens.
+6. Once the node is joined, the provider service can compare the blueprint runtime stack against detected runtime capabilities.
+7. If the joined node still lacks the requested runtime stack and the provider returned SSH details, the provider service can start a background runtime bootstrap on the node.
+8. The created external resource is still outside the mesh until node-agent heartbeat happens.
 
 ## Bootstrap Strategy
 
@@ -52,10 +54,23 @@ They currently include:
 - heartbeat destination placeholders
 - cached model hints
 - trust and network labels
+- runtime stack hints
+- optional preferred launch profile
+- staged bootstrap hints for join grace, disk cleanup, retry count, and timeout values
 - rendered `cloud-init` user-data
 - an `onstart` command for VM or Pod style providers
+- a post-join runtime bootstrap command for SSH-capable providers
 
 The generated bootstrap contract reuses the existing node-agent entrypoint from [daemon.py](/Users/ivandry/GitHub/Claude-Code-Game-Studios/cluster/node_agent/daemon.py).
+
+The post-join runtime bootstrap path currently uses runtime installer scripts under [scripts/runtime](/Users/ivandry/GitHub/Claude-Code-Game-Studios/scripts/runtime) and is intentionally separate from the node-agent heartbeat.
+
+The current provider bootstrap flow is intentionally staged:
+
+- wait briefly after join before starting heavy runtime setup
+- run disk preflight/cleanup before each install attempt
+- retry runtime installation with a bounded timeout
+- refresh the registry snapshot after repair or post-install probe
 
 ## Adapter Boundaries
 

@@ -2,13 +2,17 @@
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$HOME/Claude-Code-Game-Studios}"
+PROVIDER_BOOTSTRAP_MIN_FREE_DISK_GIB="${PROVIDER_BOOTSTRAP_MIN_FREE_DISK_GIB:-10}"
+export REPO_ROOT PROVIDER_BOOTSTRAP_MIN_FREE_DISK_GIB
 
 if [[ $# -eq 0 ]]; then
   echo "usage: $0 <runtime> [<runtime> ...]" >&2
   exit 2
 fi
 
-cd "$REPO_ROOT"
+source "$REPO_ROOT/scripts/runtime/provider_bootstrap_common.sh"
+
+provider_bootstrap_preflight_disk_space
 
 for runtime in "$@"; do
   case "$runtime" in
@@ -39,6 +43,7 @@ print(json.dumps(result, sort_keys=True))
 if target is None or not target.exists() or nvcc_path is None:
     raise SystemExit(2)
 ' "$EXECUTABLE_PATH"
+      provider_bootstrap_preflight_disk_space
       ;;
     *)
       echo "provider repair: unsupported runtime '$runtime'" >&2

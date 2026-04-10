@@ -19,6 +19,8 @@ The current implementation adds a provider service under [cluster/providers](/Us
 - real `Vast` create-path when `VAST_API_KEY` is configured
 - dry-run provider resource creation stubs for the remaining providers
 - bootstrap bundle generation for future auto-join
+- post-join runtime bootstrap plans for provider-created nodes
+- best-effort SSH runtime bootstrap once a joined node exposes provider SSH details
 
 For `Vast`, a non-dry-run `providers-provision` request now uses the real
 provider create endpoint when `VAST_API_KEY` is present. Without that key, the
@@ -67,7 +69,17 @@ Joining:
 - Can now be waited for directly during `providers-provision` when the caller passes `--wait-for-join`.
 - Can now be confirmed from provider jobs through `providers-reconcile-jobs`.
 - Marks the job as `joined`, captures the matched `node_id`, and stores a snapshot of the joined node.
+- Can now carry a separate `runtime_bootstrap_status` alongside the join status.
+- When a joined node still lacks the runtime stack requested by the blueprint, the provider service can start a background runtime bootstrap over SSH.
 - Only after that does the resource become `NodeInventory` and participate in scheduling.
+
+Runtime bootstrap:
+
+- Is driven by blueprint-level `runtime_stack` and optional `preferred_launch_profile`.
+- Uses a staged flow that waits briefly after join, performs disk preflight/cleanup, and then installs runtimes with retries and timeouts through [bootstrap_provider_node.sh](/Users/ivandry/GitHub/Claude-Code-Game-Studios/scripts/runtime/bootstrap_provider_node.sh).
+- Is recorded separately from provider provisioning in the `ProvisionJob`.
+- Still treats model preloading as deferred work; the current phase focuses on getting runtime environments onto the joined node without overwhelming fresh provider disks or SSH services.
+- Can surface `stabilizing`, `starting`, `repairing`, and `ready` states during bootstrap.
 
 ## What Is Deferred
 
@@ -80,6 +92,8 @@ This phase intentionally does not implement:
 - automatic NAT traversal
 - full provider create flows in production mode for `runpod` and `nebius`
 - background async waiting/polling for cluster join after provisioning
+- full post-join runtime bootstrap coverage for `ollama` and `tensorrt-llm`
+- automatic model artifact preloading after runtime installation
 
 ## Managed Vs Bring Your Own Provider
 

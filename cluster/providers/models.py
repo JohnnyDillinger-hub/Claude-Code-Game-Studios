@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Any, Iterable
 
 from cluster.models import format_datetime, parse_datetime, utc_now
+from cluster.node_agent.preflight_models import NodePreflightReport
 
 
 def _sorted_labels(labels: Mapping[str, str] | None) -> tuple[tuple[str, str], ...]:
@@ -134,6 +135,8 @@ class ProviderBlueprint:
     network_tier: str | None = None
     default_gpu_count: int | None = None
     default_region: str | None = None
+    runtime_stack: tuple[str, ...] = field(default_factory=tuple)
+    preferred_launch_profile: str | None = None
     provider_config_template: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -148,6 +151,7 @@ class ProviderBlueprint:
             "provider": self.provider,
             "runtime_family": self.runtime_family,
             "cached_models": list(self.cached_models),
+            "runtime_stack": list(self.runtime_stack),
             "provider_config_template": self.provider_config_template,
         }
         if self.labels:
@@ -162,6 +166,8 @@ class ProviderBlueprint:
             payload["default_gpu_count"] = self.default_gpu_count
         if self.default_region is not None:
             payload["default_region"] = self.default_region
+        if self.preferred_launch_profile is not None:
+            payload["preferred_launch_profile"] = self.preferred_launch_profile
         return payload
 
     @classmethod
@@ -183,6 +189,12 @@ class ProviderBlueprint:
                 else None
             ),
             default_region=str(payload["default_region"]) if payload.get("default_region") else None,
+            runtime_stack=_string_tuple(payload.get("runtime_stack")),
+            preferred_launch_profile=(
+                str(payload["preferred_launch_profile"])
+                if payload.get("preferred_launch_profile")
+                else None
+            ),
             provider_config_template=_dict_copy(payload.get("provider_config_template")),
         )
 
@@ -269,9 +281,13 @@ class BootstrapBundle:
     trust_tier: str | None = None
     network_tier: str | None = None
     runtime_labels: tuple[str, ...] = field(default_factory=tuple)
+    runtime_stack: tuple[str, ...] = field(default_factory=tuple)
+    preferred_launch_profile: str | None = None
     node_agent_config: dict[str, Any] = field(default_factory=dict)
     cloud_init_user_data: str | None = None
     onstart_command: str | None = None
+    runtime_bootstrap_command: str | None = None
+    runtime_bootstrap_log_path: str | None = None
 
     @property
     def labels_map(self) -> dict[str, str]:
@@ -282,6 +298,7 @@ class BootstrapBundle:
             "node_id": self.node_id,
             "cached_models": list(self.cached_models),
             "runtime_labels": list(self.runtime_labels),
+            "runtime_stack": list(self.runtime_stack),
             "node_agent_config": self.node_agent_config,
         }
         if self.labels:
@@ -300,10 +317,16 @@ class BootstrapBundle:
             payload["trust_tier"] = self.trust_tier
         if self.network_tier is not None:
             payload["network_tier"] = self.network_tier
+        if self.preferred_launch_profile is not None:
+            payload["preferred_launch_profile"] = self.preferred_launch_profile
         if self.cloud_init_user_data is not None:
             payload["cloud_init_user_data"] = self.cloud_init_user_data
         if self.onstart_command is not None:
             payload["onstart_command"] = self.onstart_command
+        if self.runtime_bootstrap_command is not None:
+            payload["runtime_bootstrap_command"] = self.runtime_bootstrap_command
+        if self.runtime_bootstrap_log_path is not None:
+            payload["runtime_bootstrap_log_path"] = self.runtime_bootstrap_log_path
         return payload
 
     @classmethod
@@ -330,11 +353,27 @@ class BootstrapBundle:
             trust_tier=str(payload["trust_tier"]) if payload.get("trust_tier") else None,
             network_tier=str(payload["network_tier"]) if payload.get("network_tier") else None,
             runtime_labels=_string_tuple(payload.get("runtime_labels")),
+            runtime_stack=_string_tuple(payload.get("runtime_stack")),
+            preferred_launch_profile=(
+                str(payload["preferred_launch_profile"])
+                if payload.get("preferred_launch_profile")
+                else None
+            ),
             node_agent_config=_dict_copy(payload.get("node_agent_config")),
             cloud_init_user_data=(
                 str(payload["cloud_init_user_data"]) if payload.get("cloud_init_user_data") else None
             ),
             onstart_command=str(payload["onstart_command"]) if payload.get("onstart_command") else None,
+            runtime_bootstrap_command=(
+                str(payload["runtime_bootstrap_command"])
+                if payload.get("runtime_bootstrap_command")
+                else None
+            ),
+            runtime_bootstrap_log_path=(
+                str(payload["runtime_bootstrap_log_path"])
+                if payload.get("runtime_bootstrap_log_path")
+                else None
+            ),
         )
 
 
@@ -402,6 +441,138 @@ class ProvisionedResource:
 
 
 @dataclass(frozen=True, slots=True)
+class RepairAction:
+    action_id: str
+    node_id: str
+    runtime: str | None
+    kind: str
+    status: str
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    auto_retryable: bool = True
+    requires_reboot: bool = False
+    user_visible_label: str | None = None
+    detail: str | None = None
+    log_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action_id": self.action_id,
+            "node_id": self.node_id,
+            "kind": self.kind,
+            "status": self.status,
+            "auto_retryable": self.auto_retryable,
+            "requires_reboot": self.requires_reboot,
+        }
+        if self.runtime is not None:
+            payload["runtime"] = self.runtime
+        if self.started_at is not None:
+            payload["started_at"] = format_datetime(self.started_at)
+        if self.finished_at is not None:
+            payload["finished_at"] = format_datetime(self.finished_at)
+        if self.user_visible_label is not None:
+            payload["user_visible_label"] = self.user_visible_label
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        if self.log_path is not None:
+            payload["log_path"] = self.log_path
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RepairAction":
+        return cls(
+            action_id=str(payload["action_id"]),
+            node_id=str(payload["node_id"]),
+            runtime=str(payload["runtime"]) if payload.get("runtime") is not None else None,
+            kind=str(payload["kind"]),
+            status=str(payload["status"]),
+            started_at=(
+                parse_datetime(str(payload["started_at"]))
+                if payload.get("started_at") is not None
+                else None
+            ),
+            finished_at=(
+                parse_datetime(str(payload["finished_at"]))
+                if payload.get("finished_at") is not None
+                else None
+            ),
+            auto_retryable=bool(payload.get("auto_retryable", True)),
+            requires_reboot=bool(payload.get("requires_reboot", False)),
+            user_visible_label=(
+                str(payload["user_visible_label"])
+                if payload.get("user_visible_label") is not None
+                else None
+            ),
+            detail=str(payload["detail"]) if payload.get("detail") is not None else None,
+            log_path=str(payload["log_path"]) if payload.get("log_path") is not None else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeInstallStatus:
+    runtime: str
+    status: str
+    detected_version: str | None = None
+    target_version: str | None = None
+    last_report_id: str | None = None
+    active_action_id: str | None = None
+    last_error: str | None = None
+    note: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "runtime": self.runtime,
+            "status": self.status,
+        }
+        if self.detected_version is not None:
+            payload["detected_version"] = self.detected_version
+        if self.target_version is not None:
+            payload["target_version"] = self.target_version
+        if self.last_report_id is not None:
+            payload["last_report_id"] = self.last_report_id
+        if self.active_action_id is not None:
+            payload["active_action_id"] = self.active_action_id
+        if self.last_error is not None:
+            payload["last_error"] = self.last_error
+        if self.note is not None:
+            payload["note"] = self.note
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeInstallStatus":
+        return cls(
+            runtime=str(payload["runtime"]),
+            status=str(payload["status"]),
+            detected_version=(
+                str(payload["detected_version"])
+                if payload.get("detected_version") is not None
+                else None
+            ),
+            target_version=(
+                str(payload["target_version"])
+                if payload.get("target_version") is not None
+                else None
+            ),
+            last_report_id=(
+                str(payload["last_report_id"])
+                if payload.get("last_report_id") is not None
+                else None
+            ),
+            active_action_id=(
+                str(payload["active_action_id"])
+                if payload.get("active_action_id") is not None
+                else None
+            ),
+            last_error=(
+                str(payload["last_error"])
+                if payload.get("last_error") is not None
+                else None
+            ),
+            note=str(payload["note"]) if payload.get("note") is not None else None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ProvisionJob:
     job_id: str
     status: str
@@ -414,6 +585,15 @@ class ProvisionJob:
     joined_node_id: str | None = None
     joined_at: datetime | None = None
     joined_node_snapshot: dict[str, Any] = field(default_factory=dict)
+    runtime_bootstrap_status: str | None = None
+    runtime_bootstrap_started_at: datetime | None = None
+    runtime_bootstrap_finished_at: datetime | None = None
+    runtime_bootstrap_command: str | None = None
+    runtime_bootstrap_note: str | None = None
+    preflight_status: str | None = None
+    preflight_report: NodePreflightReport | None = None
+    repair_actions: tuple[RepairAction, ...] = field(default_factory=tuple)
+    runtime_install_statuses: tuple[RuntimeInstallStatus, ...] = field(default_factory=tuple)
     error_code: str | None = None
     error_message: str | None = None
 
@@ -437,6 +617,30 @@ class ProvisionJob:
             payload["joined_at"] = format_datetime(self.joined_at)
         if self.joined_node_snapshot:
             payload["joined_node_snapshot"] = self.joined_node_snapshot
+        if self.runtime_bootstrap_status is not None:
+            payload["runtime_bootstrap_status"] = self.runtime_bootstrap_status
+        if self.runtime_bootstrap_started_at is not None:
+            payload["runtime_bootstrap_started_at"] = format_datetime(
+                self.runtime_bootstrap_started_at
+            )
+        if self.runtime_bootstrap_finished_at is not None:
+            payload["runtime_bootstrap_finished_at"] = format_datetime(
+                self.runtime_bootstrap_finished_at
+            )
+        if self.runtime_bootstrap_command is not None:
+            payload["runtime_bootstrap_command"] = self.runtime_bootstrap_command
+        if self.runtime_bootstrap_note is not None:
+            payload["runtime_bootstrap_note"] = self.runtime_bootstrap_note
+        if self.preflight_status is not None:
+            payload["preflight_status"] = self.preflight_status
+        if self.preflight_report is not None:
+            payload["preflight_report"] = self.preflight_report.to_dict()
+        if self.repair_actions:
+            payload["repair_actions"] = [item.to_dict() for item in self.repair_actions]
+        if self.runtime_install_statuses:
+            payload["runtime_install_statuses"] = [
+                item.to_dict() for item in self.runtime_install_statuses
+            ]
         if self.error_code is not None:
             payload["error_code"] = self.error_code
         if self.error_message is not None:
@@ -475,6 +679,51 @@ class ProvisionJob:
                 else None
             ),
             joined_node_snapshot=_dict_copy(payload.get("joined_node_snapshot")),
+            runtime_bootstrap_status=(
+                str(payload["runtime_bootstrap_status"])
+                if payload.get("runtime_bootstrap_status") is not None
+                else None
+            ),
+            runtime_bootstrap_started_at=(
+                parse_datetime(str(payload["runtime_bootstrap_started_at"]))
+                if payload.get("runtime_bootstrap_started_at") is not None
+                else None
+            ),
+            runtime_bootstrap_finished_at=(
+                parse_datetime(str(payload["runtime_bootstrap_finished_at"]))
+                if payload.get("runtime_bootstrap_finished_at") is not None
+                else None
+            ),
+            runtime_bootstrap_command=(
+                str(payload["runtime_bootstrap_command"])
+                if payload.get("runtime_bootstrap_command") is not None
+                else None
+            ),
+            runtime_bootstrap_note=(
+                str(payload["runtime_bootstrap_note"])
+                if payload.get("runtime_bootstrap_note") is not None
+                else None
+            ),
+            preflight_status=(
+                str(payload["preflight_status"])
+                if payload.get("preflight_status") is not None
+                else None
+            ),
+            preflight_report=(
+                NodePreflightReport.from_dict(payload["preflight_report"])
+                if isinstance(payload.get("preflight_report"), Mapping)
+                else None
+            ),
+            repair_actions=tuple(
+                RepairAction.from_dict(item)
+                for item in payload.get("repair_actions", [])
+                if isinstance(item, Mapping)
+            ),
+            runtime_install_statuses=tuple(
+                RuntimeInstallStatus.from_dict(item)
+                for item in payload.get("runtime_install_statuses", [])
+                if isinstance(item, Mapping)
+            ),
             error_code=str(payload["error_code"]) if payload.get("error_code") else None,
             error_message=str(payload["error_message"]) if payload.get("error_message") else None,
         )

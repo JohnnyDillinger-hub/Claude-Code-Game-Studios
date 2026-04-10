@@ -17,6 +17,8 @@ def load_builtin_blueprints() -> tuple[ProviderBlueprint, ...]:
             trust_tier="burst",
             network_tier="public",
             default_gpu_count=2,
+            runtime_stack=("vllm",),
+            preferred_launch_profile="qwen-coder-30b-vllm-tp2",
             provider_config_template={
                 "image": "vllm/vllm-openai:latest",
                 "runtype": "ssh_direct",
