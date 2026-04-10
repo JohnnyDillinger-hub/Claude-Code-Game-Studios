@@ -17,7 +17,8 @@ The current implementation adds a provider service under [cluster/providers](/Us
 - JSON-backed provisioning jobs
 - CLI discovery and provisioning scaffolding
 - real `Vast` create-path when `VAST_API_KEY` is configured
-- dry-run provider resource creation stubs for the remaining providers
+- real `Runpod` create-path when `RUNPOD_API_KEY` is configured
+- dry-run provider resource creation stubs for Nebius
 - bootstrap bundle generation for future auto-join
 - post-join runtime bootstrap plans for provider-created nodes
 - best-effort SSH runtime bootstrap once a joined node exposes provider SSH details
@@ -25,6 +26,11 @@ The current implementation adds a provider service under [cluster/providers](/Us
 For `Vast`, a non-dry-run `providers-provision` request now uses the real
 provider create endpoint when `VAST_API_KEY` is present. Without that key, the
 command must stay in `--dry-run`.
+
+For `Runpod`, a non-dry-run `providers-provision` request now uses the real Pod
+create endpoint when `RUNPOD_API_KEY` is present and the request includes a
+blueprint, template, or direct pod config. Without that key, the command must
+stay in `--dry-run`.
 
 Supported provider adapters:
 
@@ -39,6 +45,7 @@ Current provider commands in [clusterctl.py](/Users/ivandry/GitHub/Claude-Code-G
 - `providers-provision`
 - `providers-jobs`
 - `providers-reconcile-jobs`
+- `providers-destroy`
 
 `providers-provision` can now also wait for join confirmation in the same call:
 
@@ -46,6 +53,18 @@ Current provider commands in [clusterctl.py](/Users/ivandry/GitHub/Claude-Code-G
 - `--join-state-file`
 - `--join-timeout-seconds`
 - `--join-poll-interval-seconds`
+
+`providers-jobs` now supports operator-oriented filters:
+
+- `--provider`
+- `--resource-id`
+- `--resource-status`
+
+`providers-destroy` uses a preview-first safety flow:
+
+- without `--confirm`, it prints a dry-run destroy plan and does not mutate the job store
+- with `--confirm`, it destroys the concrete provider resource and marks the job as `destroyed`
+- `--resource-id` can be used instead of `--job-id` when the external resource id is known
 
 ## Discovery Vs Provisioning Vs Joining
 
@@ -73,6 +92,12 @@ Joining:
 - When a joined node still lacks the runtime stack requested by the blueprint, the provider service can start a background runtime bootstrap over SSH.
 - Only after that does the resource become `NodeInventory` and participate in scheduling.
 
+Destroying:
+
+- Can be previewed through `providers-destroy` without changing state.
+- Can be executed through `providers-destroy --confirm` to destroy a provisioned Vast resource or a stored dry-run placeholder.
+- Keeps the provider job as a durable record with `status=destroyed`.
+
 Runtime bootstrap:
 
 - Is driven by blueprint-level `runtime_stack` and optional `preferred_launch_profile`.
@@ -90,10 +115,11 @@ This phase intentionally does not implement:
 - provider-side billing controls
 - full secret management UX
 - automatic NAT traversal
-- full provider create flows in production mode for `runpod` and `nebius`
+- full provider create flow for `nebius`
 - background async waiting/polling for cluster join after provisioning
 - full post-join runtime bootstrap coverage for `ollama` and `tensorrt-llm`
 - automatic model artifact preloading after runtime installation
+- automatic background garbage collection of destroyed provider job records
 
 ## Managed Vs Bring Your Own Provider
 

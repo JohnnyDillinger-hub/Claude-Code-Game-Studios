@@ -19,11 +19,180 @@ from cluster.orchestrator.state_store import RegistryStateStore
 from cluster.providers.blueprints import load_builtin_blueprints
 from cluster.providers.job_store import ProvisionJobStore
 from cluster.providers.models import ProviderOffer, ProvisionRequest, ProvisionedResource, RepairAction
+from cluster.providers.runpod_adapter import RunpodAdapter
 from cluster.providers.vast_adapter import VastAdapter
 from cluster.providers.service import ProviderService
 
 
 class ClusterPhase4ProviderTests(unittest.TestCase):
+    @staticmethod
+    def _make_urlopen_response(payload: dict[str, object]):
+        class _Response:
+            def __init__(self, response_payload: dict[str, object]) -> None:
+                self._payload = json.dumps(response_payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return _Response(payload)
+
+    def test_runpod_adapter_real_create_normalizes_created_pod(self) -> None:
+        adapter = RunpodAdapter(api_key="test-token")
+        service = ProviderService(adapters=(adapter,))
+        blueprint = {
+            item.blueprint_id: item for item in load_builtin_blueprints()
+        }["gemma-review-node-runpod"]
+        request = ProvisionRequest(
+            provider="runpod",
+            blueprint_id="gemma-review-node-runpod",
+            dry_run=False,
+            provider_options={
+                "templateId": "template-123",
+                "gpuTypeIds": ["NVIDIA GeForce RTX 5090"],
+                "gpuCount": 2,
+                "cloudType": "SECURE",
+                "ports": ["22/tcp", "8080/http"],
+                "env": {"RUNPOD_TEST": "1"},
+                "networkVolumeId": "vol-123",
+                "supportPublicIp": True,
+            },
+        )
+        effective_request = service._apply_blueprint_defaults(request, blueprint)
+        bundle = service.build_bootstrap_bundle(effective_request, blueprint=blueprint)
+        selected_offer = ProviderOffer(
+            provider="runpod",
+            offer_id="NVIDIA GeForce RTX 5090:SECURE",
+            resource_kind="pod",
+            gpu_name="NVIDIA GeForce RTX 5090",
+            gpu_count=2,
+            region="EU-RO-1",
+            datacenter="EU-RO-1",
+            availability_mode="SECURE",
+            preemptible=False,
+            raw_provider_payload={"id": "NVIDIA GeForce RTX 5090", "displayName": "NVIDIA GeForce RTX 5090"},
+        )
+
+        def fake_urlopen(request, timeout=30):  # noqa: ARG001
+            if request.full_url == "https://rest.runpod.io/v1/pods":
+                self.assertEqual(request.get_method(), "POST")
+                payload = json.loads(request.data.decode("utf-8"))
+                self.assertEqual(payload["templateId"], "template-123")
+                self.assertEqual(payload["gpuTypeIds"], ["NVIDIA GeForce RTX 5090"])
+                self.assertEqual(payload["gpuCount"], 2)
+                self.assertEqual(payload["cloudType"], "SECURE")
+                self.assertEqual(payload["ports"], ["22/tcp", "8080/http"])
+                self.assertEqual(payload["env"]["RUNPOD_TEST"], "1")
+                self.assertEqual(payload["networkVolumeId"], "vol-123")
+                return self._make_urlopen_response(
+                    {
+                        "id": "xedezhzb9la3ye",
+                        "desiredStatus": "RUNNING",
+                        "name": bundle.node_id,
+                        "publicIp": "100.65.0.119",
+                        "portMappings": {"22": 10341, "8080": 18080},
+                        "templateId": "template-123",
+                    }
+                )
+            self.assertEqual(request.full_url, "https://rest.runpod.io/v1/pods/xedezhzb9la3ye?includeMachine=true&includeNetworkVolume=true&includeTemplate=true")
+            self.assertEqual(request.get_method(), "GET")
+            return self._make_urlopen_response(
+                {
+                    "id": "xedezhzb9la3ye",
+                    "desiredStatus": "RUNNING",
+                    "name": bundle.node_id,
+                    "publicIp": "100.65.0.119",
+                    "portMappings": {"22": 10341, "8080": 18080},
+                    "templateId": "template-123",
+                    "machine": {
+                        "dataCenterId": "EU-RO-1",
+                    },
+                    "networkVolume": {
+                        "id": "vol-123",
+                        "dataCenterId": "EU-RO-1",
+                    },
+                }
+            )
+
+        with patch("cluster.providers.runpod_adapter.urlrequest.urlopen", side_effect=fake_urlopen):
+            resource = adapter.create_resource(
+                effective_request,
+                bundle,
+                blueprint=blueprint,
+                selected_offer=selected_offer,
+            )
+
+        self.assertEqual(resource.provider, "runpod")
+        self.assertEqual(resource.resource_id, "xedezhzb9la3ye")
+        self.assertEqual(resource.status, "running")
+        self.assertEqual(resource.host, "100.65.0.119")
+        self.assertEqual(resource.public_ip, "100.65.0.119")
+        self.assertEqual(resource.ssh_user, "root")
+        self.assertEqual(resource.ssh_port, 10341)
+        self.assertEqual(resource.offer_id, "NVIDIA GeForce RTX 5090:SECURE")
+        self.assertEqual(resource.region, "EU-RO-1")
+        self.assertEqual(resource.raw_provider_payload["pod"]["templateId"], "template-123")
+
+    def test_runpod_adapter_real_create_accepts_direct_config_without_blueprint(self) -> None:
+        adapter = RunpodAdapter(api_key="test-token")
+        service = ProviderService(adapters=(adapter,))
+        request = ProvisionRequest(
+            provider="runpod",
+            dry_run=False,
+            provider_options={
+                "imageName": "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04",
+                "gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
+                "gpuCount": 1,
+                "cloudType": "COMMUNITY",
+                "ports": ["22/tcp"],
+                "supportPublicIp": True,
+                "env": {"RUNPOD_MODE": "direct"},
+            },
+        )
+        bundle = service.build_bootstrap_bundle(request, blueprint=None)
+
+        def fake_urlopen(request, timeout=30):  # noqa: ARG001
+            if request.full_url == "https://rest.runpod.io/v1/pods":
+                payload = json.loads(request.data.decode("utf-8"))
+                self.assertEqual(payload["imageName"], "runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04")
+                self.assertEqual(payload["gpuTypeIds"], ["NVIDIA GeForce RTX 4090"])
+                self.assertEqual(payload["gpuCount"], 1)
+                self.assertEqual(payload["cloudType"], "COMMUNITY")
+                return self._make_urlopen_response(
+                    {
+                        "id": "pod-direct-123",
+                        "desiredStatus": "RUNNING",
+                        "name": bundle.node_id,
+                        "publicIp": "100.65.0.120",
+                        "portMappings": {"22": 10422},
+                    }
+                )
+            return self._make_urlopen_response(
+                {
+                    "id": "pod-direct-123",
+                    "desiredStatus": "RUNNING",
+                    "name": bundle.node_id,
+                    "publicIp": "100.65.0.120",
+                    "portMappings": {"22": 10422},
+                    "machine": {"dataCenterId": "US-KS-2"},
+                }
+            )
+
+        with patch("cluster.providers.runpod_adapter.urlrequest.urlopen", side_effect=fake_urlopen):
+            resource = adapter.create_resource(request, bundle)
+
+        self.assertEqual(resource.resource_id, "pod-direct-123")
+        self.assertEqual(resource.host, "100.65.0.120")
+        self.assertEqual(resource.public_ip, "100.65.0.120")
+        self.assertEqual(resource.ssh_port, 10422)
+        self.assertEqual(resource.status, "running")
+        self.assertEqual(resource.region, "US-KS-2")
+
     def test_node_preflight_report_marks_missing_deepspeed_nvcc_as_repairable(self) -> None:
         node = NodeInventory(
             node_id="node-preflight-1",
@@ -319,6 +488,102 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         self.assertEqual(created["job_id"], loaded["job_id"])
         self.assertEqual(loaded["status"], "bootstrapping")
 
+    def test_clusterctl_lists_provider_jobs_with_resource_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "provider-jobs.json"
+            service = ProviderService(jobs_file=jobs_file)
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "providers-jobs",
+                        "--jobs-file",
+                        str(jobs_file),
+                        "--provider",
+                        "vast",
+                        "--resource-status",
+                        "dry-run",
+                        "--resource-id",
+                        job.provisioned_resource.resource_id if job.provisioned_resource else "",
+                    ]
+                )
+            payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(payload["jobs"]), 1)
+        self.assertEqual(payload["jobs"][0]["job_id"], job.job_id)
+
+    def test_clusterctl_destroys_provider_job_preview_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "provider-jobs.json"
+            service = ProviderService(jobs_file=jobs_file)
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "providers-destroy",
+                        "--jobs-file",
+                        str(jobs_file),
+                        "--resource-id",
+                        job.provisioned_resource.resource_id if job.provisioned_resource else "",
+                    ]
+                )
+            payload = json.loads(buffer.getvalue())
+            persisted = ProvisionJobStore(jobs_file).load()[0]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "dry-run")
+        self.assertEqual(payload["job_id"], job.job_id)
+        self.assertEqual(persisted.status, "bootstrapping")
+
+    def test_clusterctl_destroys_provider_job_with_confirm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jobs_file = Path(tmpdir) / "provider-jobs.json"
+            service = ProviderService(jobs_file=jobs_file)
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "providers-destroy",
+                        "--jobs-file",
+                        str(jobs_file),
+                        "--job-id",
+                        job.job_id,
+                        "--confirm",
+                    ]
+                )
+            payload = json.loads(buffer.getvalue())
+            persisted = ProvisionJobStore(jobs_file).load()[0]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["status"], "destroyed")
+        self.assertEqual(payload["job_id"], job.job_id)
+        self.assertEqual(persisted.status, "destroyed")
+
     def test_provider_service_preserves_explicit_offer_id_when_not_in_listing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             service = ProviderService(jobs_file=Path(tmpdir) / "jobs.json")
@@ -335,6 +600,63 @@ class ClusterPhase4ProviderTests(unittest.TestCase):
         assert job.selected_offer is not None
         self.assertEqual(job.selected_offer.offer_id, "offer-manual-123")
         self.assertEqual(job.provisioned_resource.offer_id, "offer-manual-123")
+
+    def test_provider_service_preview_destroy_job_is_non_destructive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            service = ProviderService(jobs_file=Path(tmpdir) / "jobs.json")
+            job = service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+
+            preview = service.preview_destroy_job(job_id=job.job_id)
+            reloaded = service.get_job(job.job_id)
+
+        self.assertEqual(preview["status"], "dry-run")
+        self.assertEqual(preview["job_id"], job.job_id)
+        self.assertEqual(preview["resource"]["status"], "dry-run")
+        self.assertIsNotNone(reloaded)
+        self.assertEqual(reloaded.status, "bootstrapping")
+
+    def test_provider_service_destroys_vast_resource_and_marks_job_destroyed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            create_service = ProviderService(jobs_file=Path(tmpdir) / "jobs-create.json")
+            job = create_service.provision(
+                ProvisionRequest(
+                    provider="vast",
+                    blueprint_id="qwen-coder-node-vast",
+                    dry_run=True,
+                )
+            )
+            assert job.bootstrap_bundle is not None
+            job = replace(
+                job,
+                status="joined",
+                provisioned_resource=ProvisionedResource(
+                    provider="vast",
+                    resource_id="99123",
+                    resource_kind="instance",
+                    display_name=job.bootstrap_bundle.node_id,
+                    host="203.0.113.10",
+                    ssh_user="root",
+                    ssh_port=40222,
+                    status="running",
+                ),
+            )
+            adapter = VastAdapter(api_key="test-token")
+            service = ProviderService(adapters=(adapter,), jobs_file=Path(tmpdir) / "jobs-destroy.json")
+            service.jobs.upsert(job)
+
+            with patch.object(adapter, "_delete_json", return_value={"success": True}) as delete_json:
+                destroyed = service.destroy_job(job_id=job.job_id)
+
+        self.assertEqual(destroyed.status, "destroyed")
+        assert destroyed.provisioned_resource is not None
+        self.assertEqual(destroyed.provisioned_resource.status, "destroyed")
+        self.assertEqual(delete_json.call_args.args[0], "https://console.vast.ai/api/v0/instances/99123/")
 
     def test_provider_service_reconciles_job_when_node_joins_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

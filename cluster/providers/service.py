@@ -294,11 +294,26 @@ class ProviderService:
             )
         return job
 
-    def list_jobs(self, *, status: str | None = None) -> list[ProvisionJob]:
+    def list_jobs(
+        self,
+        *,
+        status: str | None = None,
+        provider: str | None = None,
+        resource_id: str | None = None,
+        resource_status: str | None = None,
+    ) -> list[ProvisionJob]:
         jobs = self.jobs.load()
-        if status is None:
-            return jobs
-        return [job for job in jobs if job.status == status]
+        return [
+            job
+            for job in jobs
+            if self._job_matches_filters(
+                job,
+                status=status,
+                provider=provider,
+                resource_id=resource_id,
+                resource_status=resource_status,
+            )
+        ]
 
     def get_job(self, job_id: str) -> ProvisionJob | None:
         for job in self.jobs.load():
@@ -306,17 +321,133 @@ class ProviderService:
                 return job
         return None
 
-    def reconcile_jobs(self, registry: NodeRegistry) -> list[ProvisionJob]:
-        reconciled = [self._reconcile_job(job, registry) for job in self.jobs.load()]
+    def reconcile_jobs(
+        self,
+        registry: NodeRegistry,
+        *,
+        job_id: str | None = None,
+        provider: str | None = None,
+        resource_id: str | None = None,
+    ) -> list[ProvisionJob]:
+        reconciled: list[ProvisionJob] = []
+        for job in self.jobs.load():
+            if not self._job_matches_filters(
+                job,
+                job_id=job_id,
+                provider=provider,
+                resource_id=resource_id,
+            ):
+                reconciled.append(job)
+                continue
+            reconciled.append(self._reconcile_job(job, registry))
         self.jobs.save(reconciled)
-        return reconciled
+        return [
+            job
+            for job in reconciled
+            if self._job_matches_filters(
+                job,
+                job_id=job_id,
+                provider=provider,
+                resource_id=resource_id,
+            )
+        ]
 
-    def reconcile_jobs_from_state_file(self, state_file: str | Path) -> list[ProvisionJob]:
+    def reconcile_jobs_from_state_file(
+        self,
+        state_file: str | Path,
+        *,
+        job_id: str | None = None,
+        provider: str | None = None,
+        resource_id: str | None = None,
+    ) -> list[ProvisionJob]:
         store = RegistryStateStore(state_file)
         registry = store.load()
-        jobs = self.reconcile_jobs(registry)
+        jobs = self.reconcile_jobs(
+            registry,
+            job_id=job_id,
+            provider=provider,
+            resource_id=resource_id,
+        )
         store.save(registry)
         return jobs
+
+    def preview_destroy_job(
+        self,
+        *,
+        job_id: str | None = None,
+        resource_id: str | None = None,
+        provider: str | None = None,
+    ) -> dict[str, object]:
+        job = self._resolve_destroy_job(
+            job_id=job_id,
+            resource_id=resource_id,
+            provider=provider,
+        )
+        resource = job.provisioned_resource
+        if resource is None:
+            raise ProviderError(f"Job {job.job_id!r} does not have a provisioned resource")
+        return {
+            "status": "dry-run",
+            "job_id": job.job_id,
+            "provider": job.request.provider,
+            "job_status": job.status,
+            "resource": resource.to_dict(),
+            "message": "Re-run with --confirm to destroy the provider resource.",
+        }
+
+    def destroy_job(
+        self,
+        *,
+        job_id: str | None = None,
+        resource_id: str | None = None,
+        provider: str | None = None,
+        force: bool = False,
+    ) -> ProvisionJob:
+        job = self._resolve_destroy_job(
+            job_id=job_id,
+            resource_id=resource_id,
+            provider=provider,
+        )
+        resource = job.provisioned_resource
+        if resource is None:
+            raise ProviderError(f"Job {job.job_id!r} does not have a provisioned resource")
+        if job.status == "destroyed" or resource.status == "destroyed":
+            return job
+
+        now = utc_now()
+        if resource.status == "dry-run":
+            destroyed_resource = replace(
+                resource,
+                status="destroyed",
+                raw_provider_payload={
+                    **resource.raw_provider_payload,
+                    "destroy_mode": "dry-run-local",
+                },
+            )
+        else:
+            adapter = self._require_adapter(job.request.provider)
+            try:
+                destroyed_resource = adapter.destroy_resource(resource, dry_run=False)
+            except ProviderError:
+                if not force:
+                    raise
+                destroyed_resource = replace(
+                    resource,
+                    status="destroyed",
+                    raw_provider_payload={
+                        **resource.raw_provider_payload,
+                        "destroy_mode": "forced-local",
+                    },
+                )
+
+        destroyed_job = replace(
+            job,
+            status="destroyed",
+            updated_at=now,
+            provisioned_resource=destroyed_resource,
+        )
+        self.jobs.upsert(destroyed_job)
+        return destroyed_job
 
     def wait_for_job_join(
         self,
@@ -456,7 +587,9 @@ class ProviderService:
         )
 
     def _reconcile_job(self, job: ProvisionJob, registry: NodeRegistry) -> ProvisionJob:
-        if job.status == "failed" or job.bootstrap_bundle is None:
+        if job.status in {"failed", "destroyed"} or job.bootstrap_bundle is None:
+            return job
+        if job.provisioned_resource is not None and job.provisioned_resource.status == "destroyed":
             return job
         node_id = job.bootstrap_bundle.node_id
         record = registry.get_record(node_id)
@@ -700,6 +833,79 @@ class ProviderService:
             repair_actions=tuple(action_list),
             runtime_install_statuses=tuple(statuses),
         )
+
+    def _job_matches_filters(
+        self,
+        job: ProvisionJob,
+        *,
+        job_id: str | None = None,
+        provider: str | None = None,
+        resource_id: str | None = None,
+        resource_status: str | None = None,
+        status: str | None = None,
+    ) -> bool:
+        if job_id is not None and job.job_id != job_id:
+            return False
+        if provider is not None and not self._job_matches_provider(job, provider):
+            return False
+        if resource_id is not None and not self._job_matches_resource_id(job, resource_id):
+            return False
+        if resource_status is not None:
+            resource = job.provisioned_resource
+            if resource is None or resource.status != resource_status:
+                return False
+        if status is not None and job.status != status:
+            return False
+        return True
+
+    def _job_matches_provider(self, job: ProvisionJob, provider: str) -> bool:
+        if job.request.provider == provider:
+            return True
+        if job.selected_offer is not None and job.selected_offer.provider == provider:
+            return True
+        if job.provisioned_resource is not None and job.provisioned_resource.provider == provider:
+            return True
+        return False
+
+    def _job_matches_resource_id(self, job: ProvisionJob, resource_id: str) -> bool:
+        resource = job.provisioned_resource
+        return resource is not None and resource.resource_id == resource_id
+
+    def _resolve_destroy_job(
+        self,
+        *,
+        job_id: str | None = None,
+        resource_id: str | None = None,
+        provider: str | None = None,
+    ) -> ProvisionJob:
+        if job_id is not None:
+            job = self.get_job(job_id)
+            if job is None:
+                raise ProviderError(f"Unknown provisioning job id: {job_id}")
+            if provider is not None and not self._job_matches_provider(job, provider):
+                raise ProviderError(
+                    f"Provisioning job {job_id!r} does not belong to provider {provider!r}"
+                )
+            if resource_id is not None and not self._job_matches_resource_id(job, resource_id):
+                raise ProviderError(
+                    f"Provisioning job {job_id!r} does not match resource id {resource_id!r}"
+                )
+            return job
+
+        jobs = self.list_jobs(provider=provider, resource_id=resource_id)
+        if not jobs:
+            selector_bits = []
+            if provider is not None:
+                selector_bits.append(f"provider={provider!r}")
+            if resource_id is not None:
+                selector_bits.append(f"resource_id={resource_id!r}")
+            selector = ", ".join(selector_bits) or "unspecified selector"
+            raise ProviderError(f"No provisioning job matched {selector}")
+        if len(jobs) > 1:
+            raise ProviderError(
+                "Multiple provisioning jobs matched the destroy selector; use --job-id to disambiguate"
+            )
+        return jobs[0]
 
     def _refresh_after_runtime_repairs(
         self,

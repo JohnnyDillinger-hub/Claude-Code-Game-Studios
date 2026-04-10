@@ -33,3 +33,11 @@ class ProviderAdapter(ABC):
         selected_offer: ProviderOffer | None = None,
     ) -> ProvisionedResource:
         raise NotImplementedError
+
+    def destroy_resource(
+        self,
+        resource: ProvisionedResource,
+        *,
+        dry_run: bool = False,
+    ) -> ProvisionedResource:
+        raise ProviderError(f"Provider {self.name!r} does not support resource destruction")

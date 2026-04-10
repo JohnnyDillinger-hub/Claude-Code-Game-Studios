@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import time
+from dataclasses import replace
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -148,11 +149,53 @@ class VastAdapter(ProviderAdapter):
             },
         )
 
+    def destroy_resource(
+        self,
+        resource: ProvisionedResource,
+        *,
+        dry_run: bool = False,
+    ) -> ProvisionedResource:
+        if resource.status == "destroyed":
+            return resource
+        if dry_run or not self.api_key:
+            return replace(
+                resource,
+                status="destroy-dry-run",
+                raw_provider_payload={
+                    **resource.raw_provider_payload,
+                    "destroy_mode": "dry-run",
+                },
+            )
+        if not resource.resource_id:
+            raise ProviderError("Vast resource destruction requires a concrete resource id")
+        try:
+            contract_id = int(resource.resource_id)
+        except ValueError as exc:
+            raise ProviderError(
+                f"Vast resource id must be numeric, got {resource.resource_id!r}"
+            ) from exc
+        destroy_response = self._delete_json(f"{VAST_API_BASE}/instances/{contract_id}/")
+        if not bool(destroy_response.get("success", False)):
+            raise ProviderError(
+                f"Vast destroy response did not report success: {destroy_response}"
+            )
+        return replace(
+            resource,
+            status="destroyed",
+            raw_provider_payload={
+                **resource.raw_provider_payload,
+                "destroy_response": destroy_response,
+            },
+        )
+
     def _post_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:
         return self._request_json(url, method="POST", payload=payload)
 
     def _put_json(self, url: str, payload: dict[str, object]) -> dict[str, object]:
         return self._request_json(url, method="PUT", payload=payload)
+
+    def _delete_json(self, url: str) -> dict[str, object]:
+        return self._request_json(url, method="DELETE")
 
     def _get_json(self, url: str) -> dict[str, object]:
         return self._request_json(url, method="GET")

@@ -877,6 +877,9 @@ def build_parser() -> argparse.ArgumentParser:
     provider_jobs_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
     provider_jobs_parser.add_argument("--job-id")
     provider_jobs_parser.add_argument("--status")
+    provider_jobs_parser.add_argument("--provider", choices=sorted((*PROVIDER_CHOICES, "any")))
+    provider_jobs_parser.add_argument("--resource-id")
+    provider_jobs_parser.add_argument("--resource-status")
 
     provider_reconcile_parser = subparsers.add_parser(
         "providers-reconcile-jobs",
@@ -885,6 +888,20 @@ def build_parser() -> argparse.ArgumentParser:
     provider_reconcile_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
     provider_reconcile_parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
     provider_reconcile_parser.add_argument("--job-id")
+    provider_reconcile_parser.add_argument("--provider", choices=sorted((*PROVIDER_CHOICES, "any")))
+    provider_reconcile_parser.add_argument("--resource-id")
+
+    provider_destroy_parser = subparsers.add_parser(
+        "providers-destroy",
+        help="Destroy a provisioned provider resource safely with a preview-first workflow.",
+    )
+    provider_destroy_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
+    provider_destroy_parser.add_argument("--job-id")
+    provider_destroy_parser.add_argument("--resource-id")
+    provider_destroy_parser.add_argument("--provider", choices=sorted((*PROVIDER_CHOICES, "any")))
+    provider_destroy_parser.add_argument("--dry-run", action="store_true")
+    provider_destroy_parser.add_argument("--confirm", action="store_true")
+    provider_destroy_parser.add_argument("--force", action="store_true")
 
     update_report_parser = subparsers.add_parser(
         "developer-update-report",
@@ -1413,7 +1430,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         service = ProviderService(jobs_file=args.jobs_file)
         if args.job_id:
             job = service.get_job(args.job_id)
-            if job is None:
+            if job is None or not service._job_matches_filters(
+                job,
+                status=args.status,
+                provider=(None if args.provider in {None, "any"} else args.provider),
+                resource_id=args.resource_id,
+                resource_status=args.resource_status,
+            ):
                 print(
                     json.dumps(
                         {"status": "not_found", "job_id": args.job_id},
@@ -1424,13 +1447,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
             return 0
-        jobs = service.list_jobs(status=args.status)
+        jobs = service.list_jobs(
+            status=args.status,
+            provider=(None if args.provider in {None, "any"} else args.provider),
+            resource_id=args.resource_id,
+            resource_status=args.resource_status,
+        )
         print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
         return 0
 
     if args.command == "providers-reconcile-jobs":
         service = ProviderService(jobs_file=args.jobs_file)
-        jobs = service.reconcile_jobs_from_state_file(args.state_file)
+        jobs = service.reconcile_jobs_from_state_file(
+            args.state_file,
+            job_id=args.job_id,
+            provider=(None if args.provider in {None, "any"} else args.provider),
+            resource_id=args.resource_id,
+        )
         if args.job_id:
             for job in jobs:
                 if job.job_id == args.job_id:
@@ -1445,6 +1478,54 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
         print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "providers-destroy":
+        if args.dry_run and args.confirm:
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "reason": "--dry-run and --confirm are mutually exclusive",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        if not args.job_id and not args.resource_id:
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "reason": "Either --job-id or --resource-id is required",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        service = ProviderService(jobs_file=args.jobs_file)
+        provider = None if args.provider in {None, "any"} else args.provider
+        try:
+            if args.confirm and not args.dry_run:
+                job = service.destroy_job(
+                    job_id=args.job_id,
+                    resource_id=args.resource_id,
+                    provider=provider,
+                    force=bool(args.force),
+                )
+                print(json.dumps(job.to_dict(), indent=2, sort_keys=True))
+            else:
+                preview = service.preview_destroy_job(
+                    job_id=args.job_id,
+                    resource_id=args.resource_id,
+                    provider=provider,
+                )
+                print(json.dumps(preview, indent=2, sort_keys=True))
+        except ProviderError as exc:
+            print(json.dumps({"status": "failed", "reason": str(exc)}, indent=2, sort_keys=True))
+            return 1
         return 0
 
     if args.command == "developer-update-report":

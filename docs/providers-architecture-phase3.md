@@ -40,9 +40,12 @@ These objects are intentionally separate from [NodeInventory](/Users/ivandry/Git
 3. `providers-provision` validates a request, picks an offer, creates a provisioning job, and emits a bootstrap bundle.
 4. `providers-provision --wait-for-join` can synchronously poll the registry and return once the job becomes `joined`.
 5. `providers-reconcile-jobs` matches provisioning jobs back to the cluster registry by generated `node_id`.
-6. Once the node is joined, the provider service can compare the blueprint runtime stack against detected runtime capabilities.
-7. If the joined node still lacks the requested runtime stack and the provider returned SSH details, the provider service can start a background runtime bootstrap on the node.
-8. The created external resource is still outside the mesh until node-agent heartbeat happens.
+6. `providers-jobs` can filter by provider, resource id, and resource status so operators can inspect the live external resource set.
+7. `providers-destroy` previews or destroys a specific provider resource and keeps the job record as `destroyed`.
+8. Once the node is joined, the provider service can compare the blueprint runtime stack against detected runtime capabilities.
+9. If the joined node still lacks the requested runtime stack and the provider returned SSH details, the provider service can start a background runtime bootstrap on the node.
+10. The created external resource is still outside the mesh until node-agent heartbeat happens.
+11. `Runpod` now has a real create path when `RUNPOD_API_KEY` is configured, using either a template or direct pod config.
 
 ## Bootstrap Strategy
 
@@ -79,6 +82,7 @@ Each provider adapter is responsible for:
 - listing offers
 - validating provider-specific requests
 - creating a resource or a dry-run stub
+- destroying a resource when the provider supports it
 - normalizing provider-specific connection details into `ProvisionedResource`
 
 The provider layer does not:
@@ -95,6 +99,6 @@ That separation keeps the existing cluster orchestration stable while we add pro
 ## Recommended Next Steps
 
 1. Turn the current synchronous join wait into a background job or API-friendly async watcher.
-2. Port the same real create pattern to `runpod`.
+2. Harden the `runpod` create and destroy paths with additional template and pod-state coverage.
 3. Expose the same provider service through a thin HTTP API for the GUI.
-4. Add policy controls only after provisioning and joining are reliable.
+4. Add policy controls only after provisioning, joining, and destroy are reliable.
