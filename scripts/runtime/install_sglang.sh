@@ -7,9 +7,10 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 SGLANG_VERSION="${SGLANG_VERSION:-0.5.10.post1}"
 CUDA_NVCC_VERSION="${CUDA_NVCC_VERSION:-12.8.93}"
 
+rm -rf "$VENV_PATH"
 "$PYTHON_BIN" -m venv "$VENV_PATH"
-"$VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV_PATH/bin/python" -m pip install --upgrade \
+PIP_NO_CACHE_DIR=1 "$VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
+PIP_NO_CACHE_DIR=1 "$VENV_PATH/bin/python" -m pip install --upgrade \
   "nvidia-cuda-nvcc-cu12==$CUDA_NVCC_VERSION" \
   ninja \
   "sglang==$SGLANG_VERSION"

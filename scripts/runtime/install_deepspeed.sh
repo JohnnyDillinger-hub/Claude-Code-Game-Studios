@@ -9,10 +9,11 @@ TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.57.0}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 CUDA_NVCC_VERSION="${CUDA_NVCC_VERSION:-12.8.93}"
 
+rm -rf "$VENV_PATH"
 "$PYTHON_BIN" -m venv "$VENV_PATH"
-"$VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
-"$VENV_PATH/bin/python" -m pip install --upgrade --index-url "$TORCH_INDEX_URL" torch torchvision torchaudio
-"$VENV_PATH/bin/python" -m pip install --upgrade \
+PIP_NO_CACHE_DIR=1 "$VENV_PATH/bin/python" -m pip install --upgrade pip setuptools wheel
+PIP_NO_CACHE_DIR=1 "$VENV_PATH/bin/python" -m pip install --upgrade --index-url "$TORCH_INDEX_URL" torch torchvision torchaudio
+PIP_NO_CACHE_DIR=1 "$VENV_PATH/bin/python" -m pip install --upgrade \
   "nvidia-cuda-nvcc-cu12==$CUDA_NVCC_VERSION" \
   "deepspeed==$DEEPSPEED_VERSION" \
   "transformers==$TRANSFORMERS_VERSION" \
