@@ -35,6 +35,8 @@ def infer_runtime_adapter(preferred_backend: str, launch_metadata: dict[str, Any
         return "vllm-server"
     if backend == "sglang":
         return "sglang-server"
+    if backend == "deepspeed":
+        return "deepspeed-server"
     if backend in {"tensorrt-llm", "trtllm"}:
         return "trtllm-server"
     if backend == "python-hf":

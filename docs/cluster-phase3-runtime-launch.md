@@ -50,6 +50,13 @@ For `sglang` profiles, the remote worker now:
 This uses the same single-node multi-GPU reservation model as `vllm`, with
 dedicated profiles such as `qwen-coder-30b-sglang-tp2` and
 `qwen-coder-30b-sglang-tp4`.
+The launcher also disables piecewise CUDA graph capture by default on this
+stack, because the current FlashInfer startup path fails before readiness when
+piecewise graphs are left enabled on some SGLang builds.
+It also seeds `CUDA_HOME` from the packaged CUDA runtime or packaged NVCC
+layout in the target virtualenv when the node does not have a system CUDA
+toolkit, which keeps `deep_gemm` and FlashInfer JIT from aborting during
+startup on fresh nodes.
 
 `launch-agent` also supports request-level CUDA graph overrides for SGLang:
 
@@ -65,6 +72,29 @@ particular launch.
 `launch-agent` now also emits a top-level `deployment` object in its JSON
 response. This gives the future client API a stable, serializable contract for
 the requested profile, placement constraints, and launch preferences.
+
+### DeepSpeed
+
+For `deepspeed` profiles, the remote worker now:
+
+1. chooses a deterministic port for the selected GPU group
+2. starts the official `deepspeed` launcher with `--num_gpus`
+3. forwards a DeepSpeed-aware server script path and model/runtime flags
+4. waits for `/health` or `/v1/models`
+5. writes the endpoint, logs, and PID into the session file
+
+This path is aimed at single-node multi-GPU inference using
+`deepspeed.init_inference()` under a DeepSpeed launcher. The current profiles
+cover `qwen-coder-30b-deepspeed-tp2` and `qwen-coder-30b-deepspeed-tp4`, with
+common launch knobs such as `deepspeed_dtype`, `deepspeed_kernel_inject`, and
+optional Triton tuning flags exposed through the control plane.
+
+Fresh nodes can be bootstrapped reproducibly with:
+
+```bash
+bash scripts/runtime/install_deepspeed.sh
+bash scripts/runtime/install_sglang.sh
+```
 
 ### TensorRT-LLM
 
@@ -83,9 +113,9 @@ supported for profiles such as `qwen-coder-30b-trtllm-tp2` and
 TensorRT, and Torch library directories from the target virtualenv into
 `LD_LIBRARY_PATH` so `trtllm-serve` can resolve shared objects such as
 `libcublasLt.so.13` and `libnvinfer.so.10` on freshly provisioned nodes. When a
-packaged CUDA runtime is present inside the virtualenv, the adapter also sets
-`CUDA_HOME` from that layout so `deep_gemm`-based startup paths do not fail on
-nodes without a system CUDA toolkit.
+packaged CUDA runtime or packaged NVCC layout is present inside the virtualenv,
+the adapter also sets `CUDA_HOME` from that layout so `deep_gemm`-based startup
+paths and FlashInfer JIT do not fail on nodes without a system CUDA toolkit.
 
 ### Python / Hugging Face
 
@@ -157,10 +187,25 @@ python3 -m cluster.orchestrator.clusterctl list-remote-sessions \
   --state-file production/session-state/cluster-registry.json
 ```
 
+Optionally reap dead or stale `starting` session metadata over SSH:
+
+```bash
+python3 -m cluster.orchestrator.clusterctl reap-remote-sessions \
+  --state-file production/session-state/cluster-registry.json \
+  --stale-starting-seconds 900
+```
+
 If a previous dedicated worker is already holding a GPU, the optional
 `--probe-remote-sessions` check excludes that GPU before scheduling so the
 control plane fails early with an occupancy reason instead of discovering the
 conflict only after the SSH launch attempt.
+When this probe path is enabled, the control plane now also runs the remote
+session reaper before evaluating occupancy, so dead PIDs and stale `starting`
+records are less likely to block new smoke launches.
+For managed runtime sessions started with dedicated process groups, the reaper
+and `stop-remote-session` now also attempt a targeted process-group shutdown so
+detached worker children do not keep holding GPU memory after the session
+metadata has already gone stale.
 
 ## Still Out of Scope
 

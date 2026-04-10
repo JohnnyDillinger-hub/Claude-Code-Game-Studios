@@ -9,6 +9,7 @@ import sys
 from urllib import error
 
 from cluster.orchestrator.runtime_adapters import (
+    DEFAULT_DEEPSPEED_EXECUTABLE,
     DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_MEM_FRACTION_STATIC,
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
@@ -23,6 +24,7 @@ from cluster.orchestrator.runtime_adapters import (
     SESSION_OK_STATUSES,
     WorkerError,
     WorkerSession,
+    build_deepspeed_server_command,
     build_ollama_server_command,
     build_sglang_server_command,
     build_trtllm_serve_command,
@@ -54,7 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--launch-mode",
         default="auto",
-        choices=("auto", "ollama-server", "vllm-server", "sglang-server", "trtllm-server", "python-hf-probe"),
+        choices=(
+            "auto",
+            "ollama-server",
+            "vllm-server",
+            "sglang-server",
+            "deepspeed-server",
+            "trtllm-server",
+            "python-hf-probe",
+        ),
     )
     parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
     parser.add_argument("--server-host", default=DEFAULT_SERVER_HOST)
@@ -76,6 +86,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--script-path")
     parser.add_argument("--vllm-launch-module", default=DEFAULT_VLLM_LAUNCH_MODULE)
     parser.add_argument("--sglang-launch-module", default=DEFAULT_SGLANG_LAUNCH_MODULE)
+    parser.add_argument("--deepspeed-executable", default=DEFAULT_DEEPSPEED_EXECUTABLE)
+    parser.add_argument("--deepspeed-launch-module")
+    parser.add_argument("--deepspeed-dtype", default="fp16")
+    parser.add_argument("--deepspeed-kernel-inject", action="store_true")
+    parser.add_argument("--deepspeed-enable-cuda-graph", action="store_true")
+    parser.add_argument("--deepspeed-use-triton", action="store_true")
+    parser.add_argument("--deepspeed-triton-autotune", action="store_true")
+    parser.add_argument("--deepspeed-checkpoint-dir")
     parser.add_argument("--trtllm-executable", default=DEFAULT_TRTLLM_EXECUTABLE)
     parser.add_argument("--trtllm-backend", default=DEFAULT_TRTLLM_BACKEND)
     parser.add_argument("--trtllm-tokenizer")

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 import io
 import argparse
+import py_compile
 from unittest.mock import patch
 
 from cluster.models import (
@@ -16,21 +18,36 @@ from cluster.models import (
     LeaseInfo,
     NodeInventory,
     PlacementDecision,
+    RuntimeCapability,
     RuntimeLaunchPreferences,
     parse_datetime,
 )
+from cluster.node_agent.probe_gpu import RUNTIME_PROBE_SPECS
 from cluster.orchestrator.clusterctl import _filter_nodes_by_remote_session_claims, main as clusterctl_main
 from cluster.orchestrator.launcher import build_worker_command, launch_agent
 from cluster.orchestrator.model_profiles import get_runtime_profile, load_runtime_profiles
-from cluster.orchestrator.remote_sessions import collect_session_claims
+from cluster.orchestrator.remote_sessions import collect_session_claims, reap_stale_sessions, stop_session
 from cluster.orchestrator.remote_worker import (
+    build_deepspeed_server_command,
     build_sglang_server_command,
     build_trtllm_serve_command,
     build_vllm_server_command,
     choose_runtime_port,
     find_conflicting_session,
 )
-from cluster.orchestrator.runtime_adapters import TrtllmAdapter, infer_packaged_cuda_home
+from cluster.orchestrator.runtime_adapters import (
+    TrtllmAdapter,
+    expand_path_text,
+    get_runtime_adapter,
+    infer_packaged_cuda_bin_dirs,
+    infer_packaged_cuda_home,
+    infer_packaged_nvcc_path,
+    infer_system_cuda_home,
+    infer_system_nvcc_path,
+    launch_module_supports_flag,
+    repair_packaged_runtime_nvcc_link,
+    terminate_session_processes,
+)
 from cluster.orchestrator.runtime_adapters import infer_packaged_library_dirs
 from cluster.orchestrator.runtime_adapters import prepend_env_path_entries, prepend_executable_dir_to_path
 from cluster.orchestrator.registry import NodeRegistry
@@ -74,6 +91,9 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("qwen-coder-30b-sglang-tp4", profiles)
         self.assertIn("qwen-coder-30b-trtllm-tp2", profiles)
         self.assertIn("qwen-coder-30b-trtllm-tp4", profiles)
+        self.assertIn("qwen-coder-30b-deepspeed-tp2", profiles)
+        self.assertIn("qwen-coder-30b-deepspeed-tp2-safe", profiles)
+        self.assertIn("qwen-coder-30b-deepspeed-tp4", profiles)
         self.assertEqual(profiles["gemma3-4b"].preferred_backend, "ollama")
         self.assertEqual(profiles["gemma3-4b"].runtime_adapter, "ollama-server")
         self.assertEqual(profiles["qwen-coder-30b-vllm"].preferred_backend, "vllm")
@@ -91,6 +111,14 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["max_num_tokens"], 4096)
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp2"].runtime_options["max_seq_len"], 8192)
         self.assertEqual(profiles["qwen-coder-30b-trtllm-tp4"].runtime_options["pipeline_parallel_size"], 1)
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp2"].runtime_adapter, "deepspeed-server")
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp2"].runtime_options["tensor_parallel_size"], 2)
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp2"].runtime_options["deepspeed_dtype"], "fp16")
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp2-safe"].runtime_options["tensor_parallel_size"], 2)
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp2-safe"].runtime_options["max_model_len"], 8192)
+        self.assertFalse(profiles["qwen-coder-30b-deepspeed-tp2-safe"].runtime_options["deepspeed_kernel_inject"])
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp4"].runtime_options["tensor_parallel_size"], 4)
+        self.assertEqual(profiles["qwen-coder-30b-deepspeed-tp4"].runtime_options["max_model_len"], 32768)
 
     def test_build_worker_command_includes_real_ollama_launch_args(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -325,6 +353,121 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--trtllm-max-num-tokens", command)
         self.assertIn("16384", command)
 
+    def test_build_worker_command_includes_deepspeed_launch_args_for_tp2_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-deepspeed-tp2")
+        request = AgentRequest(
+            agent_id="agent-deepspeed-tp2",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-ds2",
+            host="10.0.0.65",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32050,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--launch-mode", command)
+        self.assertIn("deepspeed-server", command)
+        self.assertIn("--deepspeed-executable", command)
+        self.assertTrue(
+            any(item.endswith(".venv-deepspeed/bin/deepspeed") for item in command),
+            msg=str(command),
+        )
+        self.assertIn("--deepspeed-dtype", command)
+        self.assertIn("fp16", command)
+        self.assertIn("--deepspeed-kernel-inject", command)
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("2", command)
+        self.assertIn("--max-model-len", command)
+        self.assertIn("15360", command)
+
+    def test_build_worker_command_includes_conservative_deepspeed_launch_args_for_tp2_safe_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-deepspeed-tp2-safe")
+        request = AgentRequest(
+            agent_id="agent-deepspeed-tp2-safe",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-ds2-safe",
+            host="10.0.0.67",
+            gpu_index=0,
+            gpu_indices=(0, 1),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32050,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--launch-mode", command)
+        self.assertIn("deepspeed-server", command)
+        self.assertIn("--deepspeed-executable", command)
+        self.assertTrue(
+            any(item.endswith(".venv-deepspeed/bin/deepspeed") for item in command),
+            msg=str(command),
+        )
+        self.assertIn("--deepspeed-dtype", command)
+        self.assertIn("fp16", command)
+        self.assertNotIn("--deepspeed-kernel-inject", command)
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("2", command)
+        self.assertIn("--max-model-len", command)
+        self.assertIn("8192", command)
+        self.assertNotIn("--deepspeed-use-triton", command)
+
+    def test_build_worker_command_includes_deepspeed_launch_args_for_tp4_profile(self) -> None:
+        profile = get_runtime_profile("qwen-coder-30b-deepspeed-tp4")
+        request = AgentRequest(
+            agent_id="agent-deepspeed-tp4",
+            model_id=profile.model_name,
+            required_vram_mib=profile.required_free_vram_mib,
+            required_gpu_count=profile.required_gpu_count,
+        )
+        decision = PlacementDecision(
+            status="placed",
+            reason="test placement",
+            agent_id=request.agent_id,
+            node_id="node-ds4",
+            host="10.0.0.66",
+            gpu_index=0,
+            gpu_indices=(0, 1, 2, 3),
+            available_until=parse_datetime("2035-01-01T00:00:00Z"),
+            source="remote",
+            available_vram_mib=32100,
+            required_vram_mib=request.required_vram_mib,
+        )
+
+        command = build_worker_command(request, decision, profile)
+
+        self.assertIn("--gpu-indices", command)
+        self.assertIn("0,1,2,3", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("4", command)
+        self.assertIn("--deepspeed-use-triton", command)
+        self.assertIn("--deepspeed-triton-autotune", command)
+        self.assertNotIn("--deepspeed-enable-cuda-graph", command)
+
     def test_build_worker_command_respects_sglang_cuda_graph_overrides(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b-sglang-tp2").with_launch_overrides(
             {
@@ -357,6 +500,47 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertNotIn("--disable-cuda-graph", command)
         self.assertIn("--cuda-graph-max-bs", command)
         self.assertIn("32", command)
+
+    def test_build_deepspeed_server_command_includes_official_launcher_args(self) -> None:
+        command = build_deepspeed_server_command(
+            executable="deepspeed",
+            host="127.0.0.1",
+            port=choose_runtime_port(21020, 1),
+            model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            tensor_parallel_size=2,
+            script_path="scripts/deepspeed/server_qwen_coder.py",
+            dtype="fp16",
+            kernel_inject=True,
+            enable_cuda_graph=False,
+            use_triton=False,
+            triton_autotune=False,
+            max_model_len=15360,
+        )
+
+        self.assertEqual(command[0:3], ["deepspeed", "--num_gpus", "2"])
+        self.assertIn("scripts/deepspeed/server_qwen_coder.py", command)
+        self.assertIn("--host", command)
+        self.assertIn("127.0.0.1", command)
+        self.assertIn("--port", command)
+        self.assertIn("21021", command)
+        self.assertIn("--tensor-parallel-size", command)
+        self.assertIn("--dtype", command)
+        self.assertIn("fp16", command)
+        self.assertIn("--kernel-inject", command)
+        self.assertIn("--max-model-len", command)
+        self.assertIn("15360", command)
+
+    def test_deepspeed_server_script_exists_and_compiles(self) -> None:
+        script_path = Path("scripts/deepspeed/server_qwen_coder.py")
+        self.assertTrue(script_path.exists(), msg=str(script_path))
+        py_compile.compile(str(script_path), doraise=True)
+
+    def test_transformers_probe_checks_runtime_virtualenvs(self) -> None:
+        spec = next(item for item in RUNTIME_PROBE_SPECS if item["name"] == "transformers")
+        candidates = tuple(spec["python_candidates"])
+
+        self.assertIn(".venv-deepspeed/bin/python", candidates)
+        self.assertIn(".venv-sglang/bin/python", candidates)
 
     def test_agent_deployment_spec_roundtrip_preserves_launch_preferences(self) -> None:
         spec = AgentDeploymentSpec(
@@ -428,6 +612,7 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertIn("--trust-remote-code", command)
         self.assertIn("--disable-custom-all-reduce", command)
         self.assertIn("--disable-cuda-graph", command)
+        self.assertIn("--disable-piecewise-cuda-graph", command)
         self.assertIn("--cuda-graph-max-bs", command)
         self.assertIn("24", command)
 
@@ -518,6 +703,224 @@ class ClusterPhase3Tests(unittest.TestCase):
                 / "cuda_runtime"
             ),
         )
+
+    def test_infer_packaged_cuda_home_falls_back_to_existing_cuda_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-sglang"
+            python_path = venv_root / "bin" / "python"
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            python_path.write_text("", encoding="utf-8")
+            cuda_runtime = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+            )
+            cuda_runtime.mkdir(parents=True, exist_ok=True)
+
+            detected = infer_packaged_cuda_home(str(python_path))
+
+        self.assertEqual(detected, str(cuda_runtime))
+
+    def test_infer_packaged_cuda_home_prefers_packaged_nvcc_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-sglang"
+            python_path = venv_root / "bin" / "python"
+            python_path.parent.mkdir(parents=True, exist_ok=True)
+            python_path.write_text("", encoding="utf-8")
+            cuda_nvcc = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_nvcc"
+            )
+            (cuda_nvcc / "bin").mkdir(parents=True, exist_ok=True)
+            (cuda_nvcc / "bin" / "nvcc").write_text("", encoding="utf-8")
+            cuda_runtime = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "include"
+            )
+            cuda_runtime.mkdir(parents=True, exist_ok=True)
+            (cuda_runtime / "cuda_runtime.h").write_text("", encoding="utf-8")
+
+            detected = infer_packaged_cuda_home(str(python_path))
+
+        self.assertEqual(
+            detected,
+            str(
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_nvcc"
+            ),
+        )
+
+    def test_infer_packaged_nvcc_path_prefers_cuda_nvcc_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-deepspeed"
+            executable_path = venv_root / "bin" / "deepspeed"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+            nvcc_path = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_nvcc"
+                / "bin"
+                / "nvcc"
+            )
+            nvcc_path.parent.mkdir(parents=True, exist_ok=True)
+            nvcc_path.write_text("", encoding="utf-8")
+
+            detected = infer_packaged_nvcc_path(str(executable_path))
+
+        self.assertEqual(detected, str(nvcc_path.resolve()))
+
+    def test_infer_packaged_cuda_bin_dirs_returns_runtime_and_nvcc_bins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-deepspeed"
+            executable_path = venv_root / "bin" / "deepspeed"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+            runtime_bin = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "bin"
+            )
+            nvcc_bin = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_nvcc"
+                / "bin"
+            )
+            runtime_bin.mkdir(parents=True, exist_ok=True)
+            nvcc_bin.mkdir(parents=True, exist_ok=True)
+
+            detected = infer_packaged_cuda_bin_dirs(str(executable_path))
+
+        self.assertEqual(detected, (str(runtime_bin), str(nvcc_bin)))
+
+    def test_repair_packaged_runtime_nvcc_link_creates_runtime_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-deepspeed"
+            executable_path = venv_root / "bin" / "deepspeed"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+            nvcc_path = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_nvcc"
+                / "bin"
+                / "nvcc"
+            )
+            runtime_bin = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "bin"
+            )
+            nvcc_path.parent.mkdir(parents=True, exist_ok=True)
+            nvcc_path.write_text("", encoding="utf-8")
+
+            result = repair_packaged_runtime_nvcc_link(str(executable_path))
+            target_link = runtime_bin / "nvcc"
+
+            self.assertTrue(target_link.is_symlink())
+            self.assertEqual(target_link.resolve(), nvcc_path.resolve())
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["runtime_bin"], str(runtime_bin))
+        self.assertEqual(result["nvcc_path"], str(nvcc_path.resolve()))
+
+    def test_repair_packaged_runtime_nvcc_link_can_write_version_shim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            venv_root = Path(tmpdir) / ".venv-deepspeed"
+            executable_path = venv_root / "bin" / "deepspeed"
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_text("", encoding="utf-8")
+            runtime_bin = (
+                venv_root
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+                / "nvidia"
+                / "cuda_runtime"
+                / "bin"
+            )
+            runtime_bin.mkdir(parents=True, exist_ok=True)
+            with patch(
+                "cluster.orchestrator.runtime_adapters.infer_torch_cuda_release",
+                return_value="12.8",
+            ):
+                result = repair_packaged_runtime_nvcc_link(
+                    str(executable_path),
+                    allow_version_shim=True,
+                )
+            target_link = runtime_bin / "nvcc"
+
+            self.assertTrue(target_link.exists())
+            self.assertFalse(target_link.is_symlink())
+            self.assertIn("release 12.8", target_link.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["attempted"])
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["shimmed"])
+        self.assertEqual(result["nvcc_path"], str(runtime_bin / "nvcc"))
+
+    def test_infer_system_cuda_home_prefers_nvcc_on_path(self) -> None:
+        with patch("cluster.orchestrator.runtime_adapters.shutil.which", return_value="/opt/cuda/bin/nvcc"):
+            detected = infer_system_cuda_home()
+
+        self.assertEqual(detected, "/opt/cuda")
+
+    def test_infer_system_nvcc_path_prefers_nvcc_on_path(self) -> None:
+        with patch("cluster.orchestrator.runtime_adapters.shutil.which", return_value="/opt/cuda/bin/nvcc"):
+            detected = infer_system_nvcc_path()
+
+        self.assertEqual(detected, "/opt/cuda/bin/nvcc")
+
+    def test_launch_module_supports_flag_detects_known_option(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python3", "-m", "sglang.launch_server", "--help"],
+            returncode=0,
+            stdout="... --disable-piecewise-cuda-graph ...",
+            stderr="",
+        )
+        with patch("cluster.orchestrator.runtime_adapters.subprocess.run", return_value=completed):
+            detected = launch_module_supports_flag(
+                "python3",
+                "sglang.launch_server",
+                "--disable-piecewise-cuda-graph",
+            )
+
+        self.assertTrue(detected)
 
     def test_prepend_executable_dir_to_path_puts_venv_bin_first(self) -> None:
         env = {"PATH": "/usr/local/bin:/usr/bin"}
@@ -719,6 +1122,92 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(writes[-1]["status"], "launched")
         self.assertEqual(writes[-1]["server_pid"], 4321)
 
+    def test_deepspeed_launch_repairs_packaged_nvcc_and_prefers_packaged_cuda_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir) / "sessions"
+            bin_dir = Path(tmpdir) / "bin"
+            bin_dir.mkdir()
+            executable = bin_dir / "deepspeed"
+            executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            script_path = Path(tmpdir) / "server.py"
+            script_path.write_text("print('ok')\n", encoding="utf-8")
+
+            args = argparse.Namespace(
+                agent_id="deepspeed-agent",
+                node_id="node-a",
+                backend="deepspeed",
+                runtime_class="remote-runtime",
+                model="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+                gpu_index=0,
+                gpu_indices="0,1",
+                tensor_parallel_size=2,
+                deepspeed_executable=str(executable),
+                port_base=21000,
+                server_host="127.0.0.1",
+                startup_timeout_seconds=30,
+                request_timeout_seconds=30,
+                script_path=str(script_path),
+                deepspeed_launch_module=None,
+                deepspeed_dtype="fp16",
+                deepspeed_kernel_inject=True,
+                deepspeed_enable_cuda_graph=False,
+                deepspeed_use_triton=False,
+                deepspeed_triton_autotune=False,
+                deepspeed_checkpoint_dir=None,
+                max_model_len=8192,
+            )
+
+            captured_env: dict[str, str] = {}
+
+            def fake_start(
+                _command: list[str],
+                *,
+                env: dict[str, str],
+                stdout_log: Path,
+                stderr_log: Path,
+            ) -> int:
+                captured_env.update(env)
+                return 4321
+
+            with (
+                patch(
+                    "cluster.orchestrator.runtime_adapters.repair_packaged_runtime_nvcc_link",
+                    return_value={
+                        "attempted": True,
+                        "updated": True,
+                        "runtime_bin": "/tmp/runtime-bin",
+                        "nvcc_path": "/tmp/cuda-nvcc/bin/nvcc",
+                    },
+                ) as repair_mock,
+                patch(
+                    "cluster.orchestrator.runtime_adapters.infer_packaged_cuda_bin_dirs",
+                    return_value=("/tmp/runtime-bin", "/tmp/cuda-nvcc/bin"),
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.infer_packaged_cuda_home",
+                    return_value="/tmp/cuda-nvcc",
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.infer_system_cuda_home",
+                    return_value="/usr/local/cuda",
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.start_background_process",
+                    side_effect=fake_start,
+                ),
+                patch(
+                    "cluster.orchestrator.runtime_adapters.wait_for_json_endpoint_or_process_exit",
+                    return_value=("http://127.0.0.1:21000/health", {}),
+                ),
+            ):
+                session = get_runtime_adapter("deepspeed-server").launch(args, session_dir)
+
+        self.assertEqual(session.server_pid, 4321)
+        self.assertEqual(captured_env["CUDA_HOME"], "/tmp/cuda-nvcc")
+        self.assertEqual(captured_env["CUDA_PATH"], "/tmp/cuda-nvcc")
+        self.assertEqual(captured_env["PATH"].split(":")[0:2], ["/tmp/runtime-bin", "/tmp/cuda-nvcc/bin"])
+        repair_mock.assert_called_once_with(str(executable), allow_version_shim=True)
+
     def test_conflicting_session_detects_same_gpu_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             session_dir = Path(tmpdir)
@@ -772,6 +1261,45 @@ class ClusterPhase3Tests(unittest.TestCase):
 
         assert conflict is not None
         self.assertEqual(conflict["agent_id"], "other-agent")
+
+    def test_conflicting_session_ignores_dead_server_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            payload = {
+                "status": "launched",
+                "agent_id": "other-agent",
+                "node_id": "node-a",
+                "gpu_index": 0,
+                "listen_port": 17434,
+                "server_pid": 999999,
+            }
+            (session_dir / "other-agent.json").write_text(
+                json.dumps(payload),
+                encoding="utf-8",
+            )
+
+            conflict = find_conflicting_session(
+                session_dir,
+                agent_id="agent-a",
+                node_id="node-a",
+                gpu_index=0,
+                listen_port=17434,
+            )
+
+        self.assertIsNone(conflict)
+
+    def test_expand_path_text_prefers_passwd_home_for_home_placeholders(self) -> None:
+        fake_pwd_entry = type("PwdEntry", (), {"pw_dir": "/root"})()
+        with patch.dict("os.environ", {"HOME": "/Users/ivandry"}, clear=False):
+            with patch("cluster.orchestrator.runtime_adapters.pwd.getpwuid", return_value=fake_pwd_entry):
+                self.assertEqual(
+                    expand_path_text("$HOME/Claude-Code-Game-Studios/.venv-vllm/bin/python"),
+                    "/root/Claude-Code-Game-Studios/.venv-vllm/bin/python",
+                )
+                self.assertEqual(
+                    expand_path_text("~/Claude-Code-Game-Studios"),
+                    "/root/Claude-Code-Game-Studios",
+                )
 
     def test_launch_agent_parses_real_worker_payload(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b")
@@ -875,10 +1403,156 @@ class ClusterPhase3Tests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with patch("cluster.orchestrator.remote_sessions.os.kill", side_effect=ProcessLookupError):
+            with patch(
+                "cluster.orchestrator.runtime_adapters.os.kill",
+                side_effect=ProcessLookupError,
+            ):
                 claims = collect_session_claims(session_dir)
 
         self.assertEqual(claims, [])
+
+    def test_reap_stale_sessions_marks_dead_pid_and_stale_starting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            (session_dir / "dead.json").write_text(
+                json.dumps(
+                    {
+                        "status": "launched",
+                        "agent_id": "dead-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 0,
+                        "server_pid": 4242,
+                        "launched_at": "2026-04-09T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "stale-starting.json").write_text(
+                json.dumps(
+                    {
+                        "status": "starting",
+                        "agent_id": "stale-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 1,
+                        "launched_at": "2026-04-09T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (session_dir / "active.json").write_text(
+                json.dumps(
+                    {
+                        "status": "launched",
+                        "agent_id": "active-agent",
+                        "node_id": "node-a",
+                        "gpu_index": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "cluster.orchestrator.runtime_adapters.os.kill",
+                side_effect=ProcessLookupError,
+            ):
+                summary = reap_stale_sessions(session_dir, stale_starting_seconds=300)
+
+            dead_payload = json.loads((session_dir / "dead.json").read_text(encoding="utf-8"))
+            stale_payload = json.loads((session_dir / "stale-starting.json").read_text(encoding="utf-8"))
+            active_payload = json.loads((session_dir / "active.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["reaped_count"], 2)
+        self.assertEqual(dead_payload["status"], "stopped")
+        self.assertEqual(dead_payload["reap_reason"], "dead-server-pid")
+        self.assertEqual(stale_payload["status"], "failed")
+        self.assertEqual(stale_payload["reap_reason"], "stale-starting>300s")
+        self.assertEqual(active_payload["status"], "launched")
+
+    def test_terminate_session_processes_kills_managed_process_group(self) -> None:
+        payload = {
+            "backend": "vllm",
+            "command": ["python", "-m", "vllm.entrypoints.openai.api_server"],
+            "process_group_id": 4321,
+            "server_pid": 4321,
+        }
+        members = [
+            {"pid": 4321, "pgid": 4321, "command": "python -m vllm.entrypoints.openai.api_server"},
+            {"pid": 5001, "pgid": 4321, "command": "VLLM::Worker_TP0"},
+        ]
+
+        with (
+            patch(
+                "cluster.orchestrator.runtime_adapters.list_process_group_members",
+                side_effect=[members, members, []],
+            ),
+            patch("cluster.orchestrator.runtime_adapters.os.killpg") as killpg_mock,
+            patch("cluster.orchestrator.runtime_adapters.time.sleep"),
+        ):
+            summary = terminate_session_processes(payload, grace_seconds=0.1)
+
+        self.assertTrue(summary["attempted"])
+        self.assertTrue(summary["signaled"])
+        self.assertEqual(summary["target"], "process-group")
+        killpg_mock.assert_called_once()
+        self.assertEqual(killpg_mock.call_args.args[0], 4321)
+
+    def test_terminate_session_processes_skips_unmatched_process_group(self) -> None:
+        payload = {
+            "backend": "vllm",
+            "command": ["python", "-m", "vllm.entrypoints.openai.api_server"],
+            "process_group_id": 4321,
+            "server_pid": 4321,
+        }
+        members = [
+            {"pid": 7000, "pgid": 4321, "command": "postgres: writer process"},
+        ]
+
+        with (
+            patch(
+                "cluster.orchestrator.runtime_adapters.list_process_group_members",
+                return_value=members,
+            ),
+            patch("cluster.orchestrator.runtime_adapters.os.killpg") as killpg_mock,
+            patch("cluster.orchestrator.runtime_adapters.os.kill", side_effect=ProcessLookupError),
+        ):
+            summary = terminate_session_processes(payload)
+
+        self.assertFalse(summary["signaled"])
+        self.assertEqual(summary["skipped_reason"], "process-group-not-owned-by-managed-runtime")
+        self.assertEqual(summary["target"], "pid")
+        killpg_mock.assert_not_called()
+
+    def test_stop_session_reports_process_group_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_dir = Path(tmpdir)
+            session_path = session_dir / "agent-a.json"
+            session_path.write_text(
+                json.dumps(
+                    {
+                        "status": "launched",
+                        "agent_id": "agent-a",
+                        "node_id": "node-a",
+                        "backend": "vllm",
+                        "process_group_id": 4321,
+                        "server_pid": 4321,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "cluster.orchestrator.remote_sessions.terminate_session_processes",
+                return_value={
+                    "attempted": True,
+                    "signaled": True,
+                    "target": "process-group",
+                    "process_group_id": 4321,
+                },
+            ):
+                result = stop_session(session_dir, "agent-a")
+
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual(result["process_cleanup"]["target"], "process-group")
 
     def test_filter_nodes_by_remote_session_claims_removes_conflicting_gpus(self) -> None:
         nodes = [
@@ -979,6 +1653,109 @@ class ClusterPhase3Tests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["launch"]["status"], "blocked")
         self.assertIn("busy-agent", payload["launch"]["reason"])
+
+    def test_reap_remote_sessions_command_reports_reaper_results(self) -> None:
+        node = NodeInventory(
+            node_id="node-a",
+            host="node-a.example",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 64000),),
+        )
+        registry = NodeRegistry([node])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "registry.json"
+            RegistryStateStore(state_file).save(registry)
+            remote_payload = {
+                "session_dir": "/tmp/sessions",
+                "scanned_count": 2,
+                "reaped_count": 1,
+                "reaped": [
+                    {
+                        "agent_id": "dead-agent",
+                        "node_id": "node-a",
+                        "previous_status": "launched",
+                        "reason": "dead-server-pid",
+                        "session_file": "/tmp/sessions/dead-agent.json",
+                        "status": "stopped",
+                    }
+                ],
+            }
+            buffer = io.StringIO()
+            with patch("cluster.orchestrator.clusterctl.subprocess.run") as run_mock:
+                run_mock.return_value.stdout = json.dumps(remote_payload)
+                with redirect_stdout(buffer):
+                    exit_code = clusterctl_main(
+                        [
+                            "reap-remote-sessions",
+                            "--state-file",
+                            str(state_file),
+                            "--stale-starting-seconds",
+                            "300",
+                        ]
+                    )
+            payload = json.loads(buffer.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["nodes"][0]["result"]["reaped_count"], 1)
+
+    def test_show_node_profiles_emits_compatible_runtime_options(self) -> None:
+        node = NodeInventory(
+            node_id="cluster-5090x2-live",
+            host="92.180.27.82",
+            lease=LeaseInfo(available_until=parse_datetime("2035-01-01T00:00:00Z")),
+            gpus=(make_gpu(0, 32110, total_mib=32607), make_gpu(1, 32110, total_mib=32607)),
+            runtime_capabilities=(
+                RuntimeCapability(
+                    name="sglang",
+                    installed=True,
+                    version="0.5.10.post1",
+                    executable="/tmp/.venv-sglang/bin/python",
+                    supported_topologies=("single-gpu", "tp", "dp"),
+                ),
+                RuntimeCapability(
+                    name="deepspeed",
+                    installed=True,
+                    version="0.18.9",
+                    executable="/tmp/.venv-deepspeed/bin/python",
+                    supported_topologies=("single-gpu", "tp", "pp"),
+                ),
+                RuntimeCapability(
+                    name="transformers",
+                    installed=True,
+                    version="4.57.0",
+                    executable="/tmp/.venv-deepspeed/bin/python",
+                    supported_topologies=("single-gpu", "tp"),
+                ),
+            ),
+        )
+        registry = NodeRegistry([node])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "registry.json"
+            RegistryStateStore(state_file).save(registry)
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = clusterctl_main(
+                    [
+                        "show-node-profiles",
+                        "--state-file",
+                        str(state_file),
+                        "--node-id",
+                        "cluster-5090x2-live",
+                        "--compatible-only",
+                    ]
+                )
+
+        payload = json.loads(buffer.getvalue())
+        names = {item["name"] for item in payload["profiles"]}
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("qwen-coder-30b-sglang-tp2", names)
+        self.assertIn("qwen-coder-30b-deepspeed-tp2", names)
+        self.assertIn("gemma-3-12b-pt", names)
+        self.assertNotIn("qwen-coder-30b-sglang-tp4", names)
+        sglang_payload = next(item for item in payload["profiles"] if item["name"] == "qwen-coder-30b-sglang-tp2")
+        self.assertEqual(sglang_payload["runtime_options"]["tensor_parallel_size"], 2)
+        self.assertEqual(sglang_payload["runtime"], "sglang")
 
     def test_schedule_agent_can_place_tp2_request_on_same_node_gpu_group(self) -> None:
         profile = get_runtime_profile("qwen-coder-30b-vllm-tp2")

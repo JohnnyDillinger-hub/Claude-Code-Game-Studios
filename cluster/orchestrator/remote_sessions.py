@@ -3,17 +3,20 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
-import os
-import signal
 from pathlib import Path
 from typing import Any, Sequence
 
-from cluster.orchestrator.remote_worker import (
+from cluster.orchestrator.runtime_adapters import (
+    DEFAULT_STALE_STARTING_SECONDS,
     DEFAULT_SESSION_DIR,
     SESSION_OK_STATUSES,
     expand_path_text,
     load_session_payload,
+    reap_stale_session_payload,
     sanitize_agent_id,
+    session_payload_is_stale_starting,
+    session_payload_process_is_alive,
+    terminate_session_processes,
     write_session_payload,
 )
 
@@ -104,31 +107,58 @@ def payload_to_claim(payload: dict[str, Any]) -> RemoteSessionClaim | None:
     )
 
 
-def _payload_process_is_alive(payload: dict[str, Any]) -> bool:
-    server_pid = payload.get("server_pid")
-    if server_pid is None:
-        return True
-    try:
-        pid = int(server_pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+def reap_stale_sessions(
+    session_dir: Path,
+    *,
+    stale_starting_seconds: int = DEFAULT_STALE_STARTING_SECONDS,
+) -> dict[str, Any]:
+    reaped: list[dict[str, Any]] = []
+    scanned = 0
+    for candidate in sorted(session_dir.glob("*.json")):
+        payload = load_session_payload(candidate)
+        if payload is None:
+            continue
+        scanned += 1
+        status = str(payload.get("status") or "")
+        if status not in SESSION_OK_STATUSES:
+            continue
+        reason: str | None = None
+        if not session_payload_process_is_alive(payload):
+            reason = "dead-server-pid"
+        elif session_payload_is_stale_starting(
+            payload,
+            stale_after_seconds=stale_starting_seconds,
+        ):
+            reason = f"stale-starting>{stale_starting_seconds}s"
+        if reason is None:
+            continue
+        cleanup = terminate_session_processes(payload)
+        updated = reap_stale_session_payload(candidate, payload, reason=reason)
+        if updated is None:
+            continue
+        item = {
+            "session_file": str(candidate),
+            "agent_id": str(updated.get("agent_id") or ""),
+            "node_id": str(updated.get("node_id") or ""),
+            "previous_status": status,
+            "status": str(updated.get("status") or ""),
+            "reason": reason,
+        }
+        if cleanup.get("attempted") or cleanup.get("members_before"):
+            item["cleanup"] = cleanup
+        reaped.append(item)
+    return {
+        "session_dir": str(session_dir),
+        "scanned_count": scanned,
+        "reaped_count": len(reaped),
+        "reaped": reaped,
+    }
 
 
 def collect_session_claims(session_dir: Path) -> list[RemoteSessionClaim]:
     claims: list[RemoteSessionClaim] = []
     for payload in list_session_payloads(session_dir):
-        if not _payload_process_is_alive(payload):
+        if not session_payload_process_is_alive(payload):
             continue
         template = payload_to_claim(payload)
         if template is None:
@@ -161,12 +191,11 @@ def stop_session(session_dir: Path, agent_id: str) -> dict[str, Any]:
         }
     server_pid = payload.get("server_pid")
     stopped_pid: int | None = None
-    if server_pid is not None:
-        try:
-            stopped_pid = int(server_pid)
-            os.kill(stopped_pid, signal.SIGTERM)
-        except (OSError, TypeError, ValueError):
-            stopped_pid = None
+    try:
+        stopped_pid = int(server_pid) if server_pid is not None else None
+    except (TypeError, ValueError):
+        stopped_pid = None
+    cleanup = terminate_session_processes(payload)
     updated = dict(payload)
     updated["status"] = "stopped"
     updated["reused"] = False
@@ -185,6 +214,8 @@ def stop_session(session_dir: Path, agent_id: str) -> dict[str, Any]:
     }
     if stopped_pid is not None:
         result["server_pid"] = stopped_pid
+    if cleanup.get("attempted") or cleanup.get("members_before"):
+        result["process_cleanup"] = cleanup
     return result
 
 
@@ -194,10 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list", help="List session files and active GPU claims.")
     list_parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
+    list_parser.add_argument("--reap-stale", action="store_true")
+    list_parser.add_argument("--stale-starting-seconds", type=int, default=DEFAULT_STALE_STARTING_SECONDS)
 
     stop_parser = subparsers.add_parser("stop", help="Stop a session by agent id.")
     stop_parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
     stop_parser.add_argument("--agent-id", required=True)
+
+    reap_parser = subparsers.add_parser("reap", help="Mark dead or stale active sessions as failed/stopped.")
+    reap_parser.add_argument("--session-dir", default=DEFAULT_SESSION_DIR)
+    reap_parser.add_argument("--stale-starting-seconds", type=int, default=DEFAULT_STALE_STARTING_SECONDS)
 
     return parser
 
@@ -208,16 +245,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     session_dir = Path(expand_path_text(args.session_dir)).resolve()
 
     if args.command == "list":
+        reaper_result: dict[str, Any] | None = None
+        if args.reap_stale:
+            reaper_result = reap_stale_sessions(
+                session_dir,
+                stale_starting_seconds=args.stale_starting_seconds,
+            )
         payloads = list_session_payloads(session_dir)
         claims = [claim.to_dict() for claim in collect_session_claims(session_dir)]
+        response: dict[str, Any] = {
+            "session_dir": str(session_dir),
+            "session_count": len(payloads),
+            "sessions": payloads,
+            "claims": claims,
+        }
+        if reaper_result is not None:
+            response["reaper"] = reaper_result
         print(
             json.dumps(
-                {
-                    "session_dir": str(session_dir),
-                    "session_count": len(payloads),
-                    "sessions": payloads,
-                    "claims": claims,
-                },
+                response,
                 sort_keys=True,
             )
         )
@@ -225,6 +271,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "stop":
         print(json.dumps(stop_session(session_dir, args.agent_id), sort_keys=True))
+        return 0
+
+    if args.command == "reap":
+        print(
+            json.dumps(
+                reap_stale_sessions(
+                    session_dir,
+                    stale_starting_seconds=args.stale_starting_seconds,
+                ),
+                sort_keys=True,
+            )
+        )
         return 0
 
     parser.error(f"Unknown command: {args.command}")

@@ -32,6 +32,10 @@ from cluster.orchestrator.model_profiles import (
     get_runtime_profile,
     load_runtime_profiles,
 )
+from cluster.orchestrator.update_monitor import (
+    build_default_update_monitor,
+    render_update_report_text,
+)
 from cluster.orchestrator.remote_sessions import RemoteSessionClaim
 from cluster.orchestrator.registry import NodeRegistry
 from cluster.orchestrator.scheduler import schedule_agent
@@ -108,6 +112,92 @@ def _resolve_local_node_for_registry(args: argparse.Namespace, registry: NodeReg
     if not nodes:
         raise ValueError("Registry is empty; cannot determine a local node")
     return nodes[0]
+
+
+def _runtime_capability_name_for_profile(profile: RuntimeProfile) -> str:
+    mapping = {
+        "ollama-server": "ollama",
+        "vllm-server": "vllm",
+        "sglang-server": "sglang",
+        "trtllm-server": "tensorrt-llm",
+        "deepspeed-server": "deepspeed",
+        "python-hf-probe": "transformers",
+    }
+    return mapping.get(profile.runtime_adapter, profile.preferred_backend)
+
+
+def _required_topology_for_profile(profile: RuntimeProfile) -> str:
+    if profile.required_gpu_count <= 1:
+        return "single-gpu"
+    pipeline_parallel_size = int(profile.runtime_options.get("pipeline_parallel_size", 1) or 1)
+    if pipeline_parallel_size > 1:
+        return "pp"
+    return "tp"
+
+
+def _profile_status_for_node(node: NodeInventory, profile: RuntimeProfile) -> dict[str, object]:
+    runtime_name = _runtime_capability_name_for_profile(profile)
+    required_topology = _required_topology_for_profile(profile)
+    capability = next((item for item in node.runtime_capabilities if item.name == runtime_name), None)
+    reason = "compatible"
+    compatible = True
+
+    if capability is None or not capability.installed:
+        compatible = False
+        reason = f"runtime-missing:{runtime_name}"
+    elif required_topology not in capability.supported_topologies:
+        compatible = False
+        reason = f"topology-unsupported:{required_topology}"
+    elif profile.required_gpu_count > node.gpu_count:
+        compatible = False
+        reason = (
+            f"insufficient-gpu-count:{node.gpu_count} < {profile.required_gpu_count}"
+        )
+    else:
+        selected_gpus = sorted(
+            node.gpus,
+            key=lambda gpu: gpu.free_memory_mib,
+            reverse=True,
+        )[: profile.required_gpu_count]
+        if len(selected_gpus) < profile.required_gpu_count:
+            compatible = False
+            reason = f"insufficient-gpu-count:{len(selected_gpus)} < {profile.required_gpu_count}"
+        elif any(gpu.free_memory_mib < profile.required_free_vram_mib for gpu in selected_gpus):
+            compatible = False
+            available = min(gpu.free_memory_mib for gpu in selected_gpus)
+            reason = (
+                f"insufficient-free-vram:{available} < {profile.required_free_vram_mib}"
+            )
+
+    payload: dict[str, object] = {
+        "compatible": compatible,
+        "model_name": profile.model_name,
+        "name": profile.name,
+        "reason": reason,
+        "required_free_vram_mib": profile.required_free_vram_mib,
+        "required_gpu_count": profile.required_gpu_count,
+        "required_topology": required_topology,
+        "runtime": runtime_name,
+        "runtime_adapter": profile.runtime_adapter,
+        "runtime_options": dict(profile.runtime_options),
+    }
+    if capability is not None:
+        payload["runtime_capability"] = capability.to_dict()
+    return payload
+
+
+def _list_node_profile_statuses(
+    node: NodeInventory,
+    *,
+    compatible_only: bool = False,
+) -> list[dict[str, object]]:
+    items: list[dict[str, object]] = []
+    for _, profile in load_runtime_profiles().items():
+        payload = _profile_status_for_node(node, profile)
+        if compatible_only and not bool(payload["compatible"]):
+            continue
+        items.append(payload)
+    return items
 
 
 def _build_request(args: argparse.Namespace) -> AgentRequest:
@@ -307,75 +397,42 @@ def _probe_remote_node_inventory(
     return NodeInventory.from_dict(payload)
 
 
-def _build_remote_session_probe_command(session_dir: str) -> str:
-    script = """
-import json
-import sys
-from pathlib import Path
+def _build_remote_session_probe_command(
+    session_dir: str,
+    *,
+    stale_starting_seconds: int | None = None,
+) -> str:
+    command = [
+        "python3",
+        "-m",
+        "cluster.orchestrator.remote_sessions",
+        "list",
+        "--session-dir",
+        session_dir,
+    ]
+    if stale_starting_seconds is not None:
+        command.extend(
+            [
+                "--reap-stale",
+                "--stale-starting-seconds",
+                str(int(stale_starting_seconds)),
+            ]
+        )
+    return shlex.join(command)
 
-SESSION_OK = {"starting", "launched", "reused"}
-session_dir = Path(sys.argv[1]).expanduser()
-payloads = []
-claims = []
-if session_dir.exists():
-    for candidate in sorted(session_dir.glob("*.json")):
-        try:
-            payload = json.loads(candidate.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        payloads.append(payload)
-        status = str(payload.get("status") or "")
-        agent_id = str(payload.get("agent_id") or "").strip()
-        node_id = str(payload.get("node_id") or "").strip()
-        raw_gpu_indices = payload.get("gpu_indices")
-        if isinstance(raw_gpu_indices, list) and raw_gpu_indices:
-            try:
-                gpu_indices = [int(item) for item in raw_gpu_indices]
-            except (TypeError, ValueError):
-                gpu_indices = []
-        else:
-            gpu_index = payload.get("gpu_index")
-            if gpu_index is None:
-                gpu_indices = []
-            else:
-                try:
-                    gpu_indices = [int(gpu_index)]
-                except (TypeError, ValueError):
-                    gpu_indices = []
-        if status not in SESSION_OK or not agent_id or not node_id or not gpu_indices:
-            continue
-        for gpu_index in gpu_indices:
-            claim = {
-                "agent_id": agent_id,
-                "node_id": node_id,
-                "gpu_index": gpu_index,
-                "status": status,
-            }
-            if payload.get("backend") is not None:
-                claim["backend"] = str(payload["backend"])
-            if payload.get("model") is not None:
-                claim["model"] = str(payload["model"])
-            if payload.get("listen_port") is not None:
-                try:
-                    claim["listen_port"] = int(payload["listen_port"])
-                except (TypeError, ValueError):
-                    pass
-            if payload.get("session_file") is not None:
-                claim["session_file"] = str(payload["session_file"])
-            claims.append(claim)
 
-print(json.dumps({
-    "session_dir": str(session_dir.resolve()),
-    "session_count": len(payloads),
-    "sessions": payloads,
-    "claims": claims,
-}, sort_keys=True))
-""".strip()
-    return (
-        f"python3 -c {shlex.quote(script)} {shlex.quote(session_dir)}"
-    )
+def _build_remote_session_reap_command(session_dir: str, stale_starting_seconds: int) -> str:
+    command = [
+        "python3",
+        "-m",
+        "cluster.orchestrator.remote_sessions",
+        "reap",
+        "--session-dir",
+        session_dir,
+        "--stale-starting-seconds",
+        str(int(stale_starting_seconds)),
+    ]
+    return shlex.join(command)
 
 
 def _build_remote_session_stop_command(session_dir: str, agent_id: str) -> str:
@@ -444,7 +501,8 @@ def _fetch_remote_session_claims_for_node(
     ssh_port: int | None,
     repo_root: str,
     session_dir: str,
-) -> tuple[list[dict[str, object]], list[RemoteSessionClaim]]:
+    stale_starting_seconds: int | None = None,
+) -> tuple[list[dict[str, object]], list[RemoteSessionClaim], dict[str, object] | None]:
     resolved_ssh_user, resolved_ssh_port, resolved_repo_root = _resolve_node_access(
         node,
         ssh_user=ssh_user,
@@ -453,7 +511,10 @@ def _fetch_remote_session_claims_for_node(
     )
     command = build_remote_ssh_argv(
         host=node.host,
-        remote_command=_build_remote_session_probe_command(session_dir),
+        remote_command=_build_remote_session_probe_command(
+            session_dir,
+            stale_starting_seconds=stale_starting_seconds,
+        ),
         ssh_user=resolved_ssh_user,
         ssh_port=resolved_ssh_port,
         repo_root=resolved_repo_root,
@@ -465,8 +526,10 @@ def _fetch_remote_session_claims_for_node(
         raise ValueError(f"Remote session probe on {node.node_id} did not return a JSON object")
     sessions_raw = payload.get("sessions", [])
     claims_raw = payload.get("claims", [])
+    reaper_raw = payload.get("reaper")
     if not isinstance(sessions_raw, list) or not isinstance(claims_raw, list):
         raise ValueError(f"Remote session probe on {node.node_id} returned malformed JSON")
+    reaper_payload = reaper_raw if isinstance(reaper_raw, dict) else None
 
     claims: list[RemoteSessionClaim] = []
     for item in claims_raw:
@@ -499,7 +562,7 @@ def _fetch_remote_session_claims_for_node(
             raise ValueError(
                 f"Remote session probe on {node.node_id} returned an invalid claim: {exc}"
             ) from exc
-    return [dict(item) for item in sessions_raw if isinstance(item, dict)], claims
+    return [dict(item) for item in sessions_raw if isinstance(item, dict)], claims, reaper_payload
 
 
 def _filter_nodes_by_remote_session_claims(
@@ -510,16 +573,18 @@ def _filter_nodes_by_remote_session_claims(
     ssh_port: int | None,
     repo_root: str,
     session_dir: str,
+    stale_starting_seconds: int | None = None,
 ) -> tuple[list[NodeInventory], list[dict[str, object]]]:
     filtered_nodes: list[NodeInventory] = []
     claim_summaries: list[dict[str, object]] = []
     for node in nodes:
-        _, claims = _fetch_remote_session_claims_for_node(
+        _, claims, _ = _fetch_remote_session_claims_for_node(
             node,
             ssh_user=ssh_user,
             ssh_port=ssh_port,
             repo_root=repo_root,
             session_dir=session_dir,
+            stale_starting_seconds=stale_starting_seconds,
         )
         blocked_gpu_indices = {
             claim.gpu_index for claim in claims if claim.agent_id != request_agent_id
@@ -622,6 +687,16 @@ def build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("--remote-file")
     show_parser.add_argument("--state-file")
 
+    profile_show_parser = subparsers.add_parser(
+        "show-node-profiles",
+        help="Show launch profiles that are compatible or incompatible with a specific node.",
+    )
+    profile_show_parser.add_argument("--local-file")
+    profile_show_parser.add_argument("--remote-file")
+    profile_show_parser.add_argument("--state-file")
+    profile_show_parser.add_argument("--node-id", required=True)
+    profile_show_parser.add_argument("--compatible-only", action="store_true")
+
     schedule_parser = subparsers.add_parser("schedule-agent", help="Compute a PlacementDecision.")
     schedule_parser.add_argument("--local-file")
     schedule_parser.add_argument("--remote-file")
@@ -695,6 +770,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch_parser.add_argument("--repo-root")
     launch_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
     launch_parser.add_argument("--probe-remote-sessions", action="store_true")
+    launch_parser.add_argument("--session-stale-after-seconds", type=int, default=900)
     launch_parser.add_argument("--min-lease-remaining-seconds", type=int, default=30)
     launch_parser.add_argument(
         "--cuda-graph-mode",
@@ -715,6 +791,8 @@ def build_parser() -> argparse.ArgumentParser:
     session_list_parser.add_argument("--ssh-port", type=int)
     session_list_parser.add_argument("--repo-root")
     session_list_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
+    session_list_parser.add_argument("--reap-stale", action="store_true")
+    session_list_parser.add_argument("--stale-starting-seconds", type=int, default=900)
 
     session_stop_parser = subparsers.add_parser(
         "stop-remote-session",
@@ -729,6 +807,20 @@ def build_parser() -> argparse.ArgumentParser:
     session_stop_parser.add_argument("--ssh-port", type=int)
     session_stop_parser.add_argument("--repo-root")
     session_stop_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
+
+    session_reap_parser = subparsers.add_parser(
+        "reap-remote-sessions",
+        help="Mark dead or stale remote worker sessions as failed/stopped over SSH.",
+    )
+    session_reap_parser.add_argument("--local-file")
+    session_reap_parser.add_argument("--remote-file")
+    session_reap_parser.add_argument("--state-file")
+    session_reap_parser.add_argument("--node-id")
+    session_reap_parser.add_argument("--ssh-user")
+    session_reap_parser.add_argument("--ssh-port", type=int)
+    session_reap_parser.add_argument("--repo-root")
+    session_reap_parser.add_argument("--session-dir", default=DEFAULT_REMOTE_SESSION_DIR)
+    session_reap_parser.add_argument("--stale-starting-seconds", type=int, default=900)
 
     provider_offers_parser = subparsers.add_parser(
         "providers-list-offers",
@@ -793,6 +885,15 @@ def build_parser() -> argparse.ArgumentParser:
     provider_reconcile_parser.add_argument("--jobs-file", default=str(DEFAULT_JOBS_FILE))
     provider_reconcile_parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE))
     provider_reconcile_parser.add_argument("--job-id")
+
+    update_report_parser = subparsers.add_parser(
+        "developer-update-report",
+        help="Developer-only report of tracked component updates and release notes.",
+    )
+    update_report_parser.add_argument("--repo-root")
+    update_report_parser.add_argument("--format", choices=("json", "text"), default="json")
+    update_report_parser.add_argument("--offline", action="store_true")
+    update_report_parser.add_argument("--timeout-seconds", type=float, default=5.0)
 
     save_parser = subparsers.add_parser("save-registry", help="Save registry state to disk.")
     save_parser.add_argument("--local-file")
@@ -887,6 +988,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "show-inventory":
         registry = _load_registry_from_args(args)
         _print_inventory_summary(registry.list_nodes())
+        return 0
+
+    if args.command == "show-node-profiles":
+        registry = _load_registry_from_args(args)
+        record = registry.get_record(args.node_id)
+        if record is None:
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "node_id": args.node_id,
+                        "reason": "node-not-found",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 1
+        payload = {
+            "node_id": record.node.node_id,
+            "profiles": _list_node_profile_statuses(
+                record.node,
+                compatible_only=bool(args.compatible_only),
+            ),
+            "status": "ok",
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     if args.command == "schedule-agent":
@@ -997,6 +1125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ssh_port=args.ssh_port,
                     repo_root=args.repo_root or DEFAULT_REPO_ROOT,
                     session_dir=args.session_dir,
+                    stale_starting_seconds=args.session_stale_after_seconds,
                 )
             except (OSError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
                 print(
@@ -1094,21 +1223,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         results: list[dict[str, object]] = []
         for node in nodes:
             try:
-                sessions, claims = _fetch_remote_session_claims_for_node(
+                sessions, claims, reaper = _fetch_remote_session_claims_for_node(
                     node,
                     ssh_user=args.ssh_user,
                     ssh_port=args.ssh_port,
                     repo_root=repo_root,
                     session_dir=args.session_dir,
+                    stale_starting_seconds=(
+                        args.stale_starting_seconds if args.reap_stale else None
+                    ),
                 )
-                results.append(
-                    {
-                        "node_id": node.node_id,
-                        "host": node.host,
-                        "sessions": sessions,
-                        "claims": [claim.to_dict() for claim in claims],
-                    }
-                )
+                node_result: dict[str, object] = {
+                    "node_id": node.node_id,
+                    "host": node.host,
+                    "sessions": sessions,
+                    "claims": [claim.to_dict() for claim in claims],
+                }
+                if reaper is not None:
+                    node_result["reaper"] = reaper
+                results.append(node_result)
             except (OSError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
                 results.append(
                     {
@@ -1119,6 +1252,56 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         print(json.dumps({"nodes": results}, indent=2, sort_keys=True))
         return 0
+
+    if args.command == "reap-remote-sessions":
+        registry = _load_registry_from_args(args)
+        nodes = registry.list_nodes()
+        if args.node_id:
+            nodes = [node for node in nodes if node.node_id == args.node_id]
+        repo_root = args.repo_root or DEFAULT_REPO_ROOT
+        results: list[dict[str, object]] = []
+        had_error = False
+        for node in nodes:
+            resolved_ssh_user, resolved_ssh_port, resolved_repo_root = _resolve_node_access(
+                node,
+                ssh_user=args.ssh_user,
+                ssh_port=args.ssh_port,
+                repo_root=repo_root,
+            )
+            command = build_remote_ssh_argv(
+                host=node.host,
+                remote_command=_build_remote_session_reap_command(
+                    args.session_dir,
+                    stale_starting_seconds=args.stale_starting_seconds,
+                ),
+                ssh_user=resolved_ssh_user,
+                ssh_port=resolved_ssh_port,
+                repo_root=resolved_repo_root,
+                gpu_index=None,
+            )
+            try:
+                completed = subprocess.run(command, check=True, capture_output=True, text=True)
+                result_payload = json.loads(completed.stdout)
+                if not isinstance(result_payload, dict):
+                    raise ValueError("reaper payload is not a JSON object")
+                results.append(
+                    {
+                        "node_id": node.node_id,
+                        "host": node.host,
+                        "result": result_payload,
+                    }
+                )
+            except (OSError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+                had_error = True
+                results.append(
+                    {
+                        "node_id": node.node_id,
+                        "host": node.host,
+                        "error": str(exc),
+                    }
+                )
+        print(json.dumps({"nodes": results}, indent=2, sort_keys=True))
+        return 1 if had_error else 0
 
     if args.command == "stop-remote-session":
         registry = _load_registry_from_args(args)
@@ -1262,6 +1445,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 1
         print(json.dumps({"jobs": [job.to_dict() for job in jobs]}, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "developer-update-report":
+        try:
+            monitor = build_default_update_monitor(args.repo_root)
+            report = monitor.generate_report(
+                allow_network=not bool(args.offline),
+                timeout_seconds=args.timeout_seconds,
+            )
+        except Exception as exc:
+            payload = {
+                "status": "failed",
+                "reason": str(exc),
+                "command": "developer-update-report",
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True))
+            return 1
+        if args.format == "text":
+            print(render_update_report_text(report))
+        else:
+            print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
         return 0
 
     if args.command == "save-registry":

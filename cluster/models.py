@@ -77,6 +77,7 @@ class RuntimeCapability:
     version: str | None = None
     executable: str | None = None
     supported_topologies: tuple[str, ...] = field(default_factory=tuple)
+    details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -89,6 +90,8 @@ class RuntimeCapability:
             payload["executable"] = self.executable
         if self.supported_topologies:
             payload["supported_topologies"] = list(self.supported_topologies)
+        if self.details:
+            payload["details"] = dict(self.details)
         return payload
 
     @classmethod
@@ -99,6 +102,7 @@ class RuntimeCapability:
             version=str(payload["version"]) if payload.get("version") else None,
             executable=str(payload["executable"]) if payload.get("executable") else None,
             supported_topologies=_string_tuple(payload.get("supported_topologies")),
+            details=dict(payload.get("details") or {}),
         )
 
 

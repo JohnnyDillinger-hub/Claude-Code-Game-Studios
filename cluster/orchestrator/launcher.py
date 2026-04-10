@@ -153,6 +153,42 @@ def build_worker_command(
     )
     _append_optional_arg(
         command,
+        "--deepspeed-executable",
+        launch_metadata.get("deepspeed_executable"),
+    )
+    _append_optional_arg(
+        command,
+        "--deepspeed-launch-module",
+        launch_metadata.get("deepspeed_launch_module"),
+    )
+    _append_optional_arg(command, "--deepspeed-dtype", launch_metadata.get("deepspeed_dtype"))
+    _append_boolean_flag(
+        command,
+        "--deepspeed-kernel-inject",
+        launch_metadata.get("deepspeed_kernel_inject"),
+    )
+    _append_boolean_flag(
+        command,
+        "--deepspeed-enable-cuda-graph",
+        launch_metadata.get("deepspeed_enable_cuda_graph"),
+    )
+    _append_boolean_flag(
+        command,
+        "--deepspeed-use-triton",
+        launch_metadata.get("deepspeed_use_triton"),
+    )
+    _append_boolean_flag(
+        command,
+        "--deepspeed-triton-autotune",
+        launch_metadata.get("deepspeed_triton_autotune"),
+    )
+    _append_optional_arg(
+        command,
+        "--deepspeed-checkpoint-dir",
+        launch_metadata.get("deepspeed_checkpoint_dir"),
+    )
+    _append_optional_arg(
+        command,
         "--trtllm-executable",
         launch_metadata.get("trtllm_executable"),
     )

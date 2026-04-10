@@ -272,6 +272,90 @@
         "max_seq_len": 32768,
         "log_level": "info"
       }
+    },
+    "qwen-coder-30b-deepspeed-tp2": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 30000,
+      "required_gpu_count": 2,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "deepspeed",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "deepspeed-server",
+        "deepspeed_executable": "$HOME/Claude-Code-Game-Studios/.venv-deepspeed/bin/deepspeed",
+        "script_path": "scripts/deepspeed/server_qwen_coder.py",
+        "server_host": "127.0.0.1",
+        "port_base": 21020,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 2,
+        "max_model_len": 15360,
+        "deepspeed_dtype": "fp16",
+        "deepspeed_kernel_inject": true,
+        "deepspeed_enable_cuda_graph": false,
+        "deepspeed_use_triton": false,
+        "deepspeed_triton_autotune": false
+      }
+    },
+    "qwen-coder-30b-deepspeed-tp2-safe": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 30000,
+      "required_gpu_count": 2,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "deepspeed",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "deepspeed-server",
+        "deepspeed_executable": "$HOME/Claude-Code-Game-Studios/.venv-deepspeed/bin/deepspeed",
+        "script_path": "scripts/deepspeed/server_qwen_coder.py",
+        "server_host": "127.0.0.1",
+        "port_base": 21022,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 2,
+        "max_model_len": 8192,
+        "deepspeed_dtype": "fp16",
+        "deepspeed_kernel_inject": false,
+        "deepspeed_enable_cuda_graph": false,
+        "deepspeed_use_triton": false,
+        "deepspeed_triton_autotune": false
+      }
+    },
+    "qwen-coder-30b-deepspeed-tp4": {
+      "model_name": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "required_free_vram_mib": 20000,
+      "required_gpu_count": 4,
+      "runtime_class": "coding-agent",
+      "preferred_backend": "deepspeed",
+      "launch": {
+        "entrypoint_module": "cluster.orchestrator.remote_worker",
+        "repo_root_default": "$HOME/Claude-Code-Game-Studios",
+        "launch_mode": "deepspeed-server",
+        "deepspeed_executable": "$HOME/Claude-Code-Game-Studios/.venv-deepspeed/bin/deepspeed",
+        "script_path": "scripts/deepspeed/server_qwen_coder.py",
+        "server_host": "127.0.0.1",
+        "port_base": 21040,
+        "session_dir": "production/session-state/remote-workers",
+        "startup_timeout_seconds": 900,
+        "request_timeout_seconds": 300,
+        "warmup_prompt": "Reply with exactly READY",
+        "max_new_tokens": 8,
+        "tensor_parallel_size": 4,
+        "max_model_len": 32768,
+        "deepspeed_dtype": "fp16",
+        "deepspeed_kernel_inject": true,
+        "deepspeed_enable_cuda_graph": false,
+        "deepspeed_use_triton": true,
+        "deepspeed_triton_autotune": true
+      }
     }
   }
 }
